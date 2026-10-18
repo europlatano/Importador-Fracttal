@@ -1,4 +1,4 @@
-"""Europlátano · V12 | staged Fracttal task-plan importer.
+"""Europlátano · V13 | staged Fracttal task-plan importer.
 No asset linking, deleting, OT creation or editing. Two-stage task/subtask writes.
 """
 import io
@@ -12,9 +12,9 @@ import streamlit as st
 API='https://app.fracttal.com/api'
 TOKEN_URL='https://one.fracttal.com/oauth/token'
 TYPES={'Texto':1, 'Verificación':4, 'Lista':7}
-st.set_page_config(page_title='Importador Fracttal V12', page_icon='🛠️',layout='wide')
+st.set_page_config(page_title='Importador Fracttal V13', page_icon='🛠️',layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · V12 · Excel → plan → tareas → subtareas · SIN vincular activos')
+st.caption('Europlátano · V13 · Excel → plan → tareas → subtareas · SIN vincular activos')
 st.warning('IMPORTACIÓN REAL Y CONTROLADA. Elige una tarea y confirma cada escritura. Los activos se vinculan MANUALMENTE en Fracttal.')
 
 def secret(key):
@@ -146,7 +146,7 @@ if problems:
     st.error('Errores de validación:');st.write(problems);st.stop()
 st.success('Estructura del Excel validada. Los campos Grupo/Parte y Adjunto obligatorio serán incluidos al crear subtareas.')
 if len(ps)!=1:
-    st.error('V12 trabaja con un único plan por archivo para evitar confusiones.');st.stop()
+    st.error('V13 trabaja con un único plan por archivo para evitar confusiones.');st.stop()
 plan_name=str(ps.iloc[0]['NOMBRE_PLAN']).strip()
 with st.expander('Ver tareas y subtareas'):
     st.dataframe(ts,use_container_width=True,hide_index=True)
@@ -173,12 +173,55 @@ if len(selected_types)!=len(set(ts.TIPO_INICIAL)):
     st.warning('Selecciona un tipo principal para todas las clasificaciones del Excel.');st.stop()
 
 st.subheader('Configurar períodos y eventos')
-st.caption('Los ID de periodicidad no se adivinan. Selecciona explícitamente el ID correcto de tu Fracttal, comprobado previamente en una tarea. La V8 funcionó con el ID 2, pero no confirma por sí sola la unidad de cada fila.')
+st.info('V13: asesor de periodicidades EN SOLO LECTURA. Solo se asignarán IDs confirmados; la herramienta nunca inventa el significado de un número.')
+with st.expander('🔎 Buscar referencias de periodicidad existentes en Fracttal (solo lectura)',expanded=True):
+    st.caption('Se intentará consultar el catálogo de activadores de tareas existentes. Si tu cuenta o versión no permite la consulta, conserva el selector manual verificado.')
+    if st.button('Consultar activadores existentes (SOLO LECTURA)'):
+        try:
+            t=token()
+            # La disponibilidad de este endpoint varía; no se usa para escrituras.
+            sample=paginated(t,'/tasks_triggers/')
+            mapped=[]
+            for row in sample:
+                try:pid=int(row.get('id_period_date'))
+                except (TypeError,ValueError):continue
+                desc=''
+                for field in ('period_dates_description','period_date_description','period_description','period_date','period_dates'):
+                    value=row.get(field)
+                    if isinstance(value,str) and value.strip():desc=value.strip();break
+                item={'ID periodicidad':pid,'Unidad devuelta por Fracttal':desc or '(no informada)', 'ID tarea':row.get('id_task') or row.get('id_tasks'), 'Tipo activador':row.get('id_task_trigger_type')}
+                mapped.append(item)
+            st.session_state.v13_period_refs=mapped
+            if mapped:
+                st.success(f'Activadores con ID de periodicidad: {len(mapped)}. Comprueba los nombres antes de elegir.')
+            else:
+                st.warning('La consulta no devolvió equivalencias verificables. No deducimos los IDs.')
+        except Exception as exc:
+            st.warning('No se ha podido consultar el listado de activadores en esta configuración. No afecta al importador ni cambia Fracttal.')
+    refs=st.session_state.get('v13_period_refs',[])
+    if refs:
+        import collections
+        cnt=collections.Counter((x['ID periodicidad'],x['Unidad devuelta por Fracttal']) for x in refs)
+        st.dataframe([{'ID':key[0],'Unidad indicada por Fracttal':key[1],'Apariciones':n} for key,n in sorted(cnt.items())],hide_index=True,use_container_width=True)
+        with st.expander('Detalles de tareas de referencia'):
+            st.dataframe(refs,hide_index=True,use_container_width=True)
+st.caption('Si la API devuelve una unidad clara, selecciónala y comprueba un ejemplo en Fracttal. Si no, confirma la equivalencia manualmente mediante una tarea de referencia.')
 period_map={}
 for unit in sorted(set(ts.loc[ts.ACTIVADOR=='Fecha','UNIDAD_INTERVALO'])):
-    period_map[unit]=st.number_input(f'ID de periodicidad en Fracttal para «{unit}»',min_value=0,max_value=10000, value=0,step=1,key='period_'+unit)
-    st.caption(f'Confirma en Fracttal que el ID indicado corresponde a {unit}.')
-if any(v==0 for v in period_map.values()):st.warning('Pendiente asignar los ID de periodicidad. Las tareas por evento siguen disponibles para previsualizar.')
+    confirmed=sorted({(x['ID periodicidad'],x['Unidad devuelta por Fracttal']) for x in st.session_state.get('v13_period_refs',[]) if x['Unidad devuelta por Fracttal']!='(no informada)'})
+    if confirmed:
+        candidates=['— Elegir manualmente —']+[f'{nm} · ID {ident}' for ident,nm in confirmed]
+        choose=st.selectbox(f'Referencia disponible para «{unit}»',candidates,key='v13_select_'+unit)
+        if choose!='— Elegir manualmente —':
+            from_match=next((ident for ident,nm in confirmed if f'{nm} · ID {ident}'==choose),0)
+        else:from_match=0
+    else:from_match=0
+    entered=st.number_input(f'ID de periodicidad para «{unit}» (si tienes equivalencia verificada)',min_value=0,max_value=10000,value=0,step=1,key='period_'+unit)
+    chosen=int(entered or from_match)
+    accept=st.checkbox(f'He comprobado en Fracttal que ID {chosen or "(sin asignar)"} corresponde realmente a «{unit}».',key='v13_confirm_'+unit)
+    period_map[unit]=chosen if accept and chosen>0 else 0
+    if chosen and not accept:st.info('No se habilita la importación de esa periodicidad hasta confirmar su unidad.')
+if any(v==0 for v in period_map.values()):st.warning('Aún faltan unidades confirmadas. Puedes revisar las tareas por evento, pero las tareas por fecha seguirán bloqueadas.')
 events={}
 for _,r in ts[ts.ACTIVADOR=='Evento'].iterrows():
     events[r.ID_TAREA]=st.text_input(f'Evento para {r.ID_TAREA}: {r.NOMBRE_TAREA}',value=str(r.NOMBRE_TAREA),key='ev_'+r.ID_TAREA)
@@ -302,4 +345,4 @@ if existing is not None and len(existing)==1:
                     st.error(fmt_error(exc));st.warning('Comprueba Fracttal antes de repetir; puede haber una escritura parcial.')
 
 st.divider()
-st.caption('V12 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
+st.caption('V13 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
