@@ -1,4 +1,4 @@
-"""Europlatano Fracttal test importer V8: minimal DATE task test, stronger validation and empty-result handling."""
+"""Europlatano Fracttal test importer V9: minimal DATE task test, stronger validation and empty-result handling."""
 import io
 import json
 import hmac
@@ -9,13 +9,13 @@ import streamlit as st
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
 TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
-TEST_TASK = 'PRUEBA API – TAREA MINIMA FECHA V8 (NO OPERATIVA)'
+TEST_TASK = 'PRUEBA API – FECHA CON VERIFICACION V9 (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V8', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V9', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 8 · Prueba mínima por FECHA · SIN ACTIVOS')
-st.warning('Versión 8: prueba controlada de UNA tarea con activador de FECHA y SIN subtareas ni recursos. Detecta respuestas vacías. No importa Excel ni asocia activos. Si funciona, añadiremos subtareas y eventos en pruebas posteriores.')
+st.caption('Europlátano · Versión 9 · UNA subtarea Verificación · SIN ACTIVOS')
+st.warning('Versión 9: UNA sola tarea de prueba (UNA subtarea Verificación). No importa Excel ni vincula activos. Solo después de verificar el contenido de la solicitud.')
 
 
 def setting(key):
@@ -407,85 +407,68 @@ if preflight and preflight.get('plan_id') == st.session_state.get('test_plan_id'
 else:
     st.info('Primero pulsa «Diagnosticar listado y duplicados del plan».')
 
-st.subheader('Prueba mínima: activador por FECHA')
-st.info('Solo se enviarán los 4 campos obligatorios que documenta Fracttal: descripción, tipo principal, plan y un activador de FECHA. No se enviarán subtareas, recursos ni campos opcionales.')
-st.warning('El ID 2 de periodicidad aparece en el ejemplo oficial de la API, pero no está verificado qué unidad representa en vuestra empresa. Esta prueba NO debe vincularse a activos. Si prefieres no usarlo, no autorices la creación.')
-period_id = st.number_input('ID de periodicidad para la prueba (id_period_date)', min_value=1, max_value=100000, value=2, step=1,
-                            help='2 procede del ejemplo de Fracttal, NO presupone que sea semana o mes en vuestra configuración.')
-period_value = st.number_input('Cada cuántos períodos (value_main)', min_value=1, max_value=365, value=1, step=1)
-trigger_payload = {'id_task_trigger_type': 1, 'value_main': int(period_value),
-                   'id_period_date': int(period_id), 'id_replay': 1}
-
-st.subheader('Vista previa exacta de la solicitud (sin secretos)')
-if selected_key and st.session_state.get('test_plan_id'):
+st.subheader('Prueba controlada V9: UNA subtarea Verificación')
+st.info('Prueba independiente con un nombre nuevo. Mantiene la estructura de FECHA que funcionó en V8, salvo V11 que prueba EVENTO. No modifica tareas anteriores.')
+import copy
+period_id = st.number_input('ID de periodicidad (confirmar con V8)', min_value=1, max_value=100000, value=2, step=1, key='period_v9')
+period_value = st.number_input('Cada cuántos períodos', min_value=1, max_value=365, value=1, step=1, key='value_v9')
+subtasks_payload = [{"description": "Comprobar el estado general (prueba)", "id_task_form_item_type": 4, "is_required": True, "attachments_required": False}]
+trigger_payload = {'id_task_trigger_type': 1, 'value_main': int(period_value), 'id_period_date': int(period_id), 'id_replay': 1}
+st.caption('Se usa activador por FECHA para aislar la prueba. El ID de periodicidad debe coincidir con el que funcionó en V8.')
+st.subheader('Previsualización del POST (sin secretos)')
+plan_id = st.session_state.get('test_plan_id')
+preview_payload = None
+if selected_key and plan_id:
     preview_payload = {
         'description': TEST_TASK,
         'id_task_type_main': int(selected_key[1]),
-        'id_group_task': int(st.session_state.test_plan_id),
+        'id_group_task': int(plan_id),
         'triggers': [trigger_payload],
+        'subtasks': subtasks_payload,
     }
     st.json(preview_payload, expanded=True)
-    st.caption('Al dejar fuera subtasks, resources y los campos opcionales, aislamos la validación de los campos mínimos. Los valores opcionales serán completados por Fracttal si admite sus valores por defecto.')
 else:
-    preview_payload = None
-    st.info('Localiza el plan y selecciona un tipo de tarea principal antes de continuar.')
+    st.info('Primero localiza el plan y elige un tipo principal de tarea.')
 
-st.caption('Esta prueba crea UNA tarea de FECHA SIN SUBTAREAS dentro del plan de prueba; no vincula activos ni genera órdenes de trabajo.')
-manual_override = bool(preflight and not preflight.get('listing_ok') and preflight.get('plan_count') == 0)
-if manual_override:
-    verified_empty = st.checkbox('HE COMPROBADO en Fracttal que el plan de prueba tiene 0 tareas.', key='verified_empty_v8')
-else:
-    verified_empty = False
-ack_event = st.checkbox('Autorizo crear UNA tarea real de FECHA sin subtareas, sin activos.', key='ack_event_v8')
-typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task_v8')
-preflight_good = bool(preflight and (preflight.get('listing_ok') and not preflight.get('existing') or manual_override and verified_empty))
-can_create_task = bool(ready and st.session_state.get('test_plan_id') and selected_key and ack_event
-                       and typed_task == 'CREAR TAREA PRUEBA' and preview_payload is not None and preflight_good and not st.session_state.get('task_post_attempted_v8'))
-if st.button('🧪 Crear UNA tarea mínima por fecha (sin subtareas)', disabled=not can_create_task):
-    st.session_state.task_post_attempted_v8 = True  # Never submit twice in one session.
-    plan_id = int(st.session_state.test_plan_id)
-    main_type_id = int(selected_key[1])
-    payload = preview_payload
-    def attempt_task_once():
+# No trust in stale preflight after post; duplicate protection runs immediately before POST.
+preflight = st.session_state.get('preflight')
+preflight_good = bool(preflight and preflight.get('plan_id') == plan_id and preflight.get('listing_ok') and not preflight.get('existing'))
+if preflight and preflight.get('listing_ok') and preflight.get('existing'):
+    st.error('Ya existe la tarea de esta versión. Se bloquea otro intento.')
+if preflight and not preflight.get('listing_ok'):
+    st.warning('No se pudo consultar las tareas del plan. NO se hará POST hasta obtener una consulta fiable. No se usa excepción manual.')
+confirmed = st.checkbox('HE COMPROBADO en Fracttal que esta tarea concreta NO existe y entiendo que se creará un registro real.', key='confirm_unique_v9')
+authorized = st.checkbox('Autorizo UNA tarea real de prueba sin activos ni OT.', key='confirm_write_v9')
+phrase = st.text_input('Escribe CREAR TAREA PRUEBA para confirmar', key='phrase_v9')
+can_post = bool(ready and preview_payload and preflight_good and confirmed and authorized and phrase == 'CREAR TAREA PRUEBA' and not st.session_state.get('attempted_v9'))
+if st.button('🧪 Crear tarea de prueba V9', disabled=not can_post):
+    st.session_state.attempted_v9 = True
+    def write_once():
         token = get_token()
-        # Independent last-minute read; if it fails, use the user's explicit
-        # empty-plan override and a current reported count of 0.
-        try:
-            before = exact_tasks_in_plan(token, plan_id)
-        except ValueError as exc:
-            if not manual_override or not verified_empty:
-                raise ValueError('No es posible verificar duplicados justo antes de escribir: ' + str(exc)) from exc
-            plans = matching_test_plans(fetch_all_plans(token))
-            if len(plans) != 1 or int(plans[0].get('task_number', -1)) != 0:
-                raise ValueError('El plan ya no informa 0 tareas. Escribe bloqueada.') from exc
-            before = []
-        if any(str(row.get('description','')).strip().casefold() == TEST_TASK.casefold() for row in before):
-            return 'EXISTE', None, 0
-        status, response = call_api('POST', '/tasks_plan/', token, payload=payload)
-        data = response.get('data') if isinstance(response, dict) else None
-        returned_id = data.get('id') if isinstance(data, dict) else None
-        if status == 201 and returned_id:
-            return 'CREADA', returned_id, status
-        # An unrecognized success response is ambiguous; never auto-resend.
-        try:
-            after = exact_tasks_in_plan(token, plan_id)
-            matches = [r for r in after if str(r.get('description','')).strip().casefold() == TEST_TASK.casefold()]
-            if len(matches) == 1:
-                return 'VERIFICADA', matches[0].get('id'), status
-        except ValueError:
-            pass
-        raise ValueError(f'POST terminó con HTTP {status}, sin confirmación suficiente de ID. Revisa Fracttal; NO reintentes.')
-    result, error = safe_api_action(attempt_task_once)
+        # Repeat duplicate check at write time; do not trust an old UI result.
+        current = exact_tasks_in_plan(token, int(plan_id))
+        if any(str(item.get('description', '')).strip().casefold() == TEST_TASK.casefold() for item in current):
+            return ('EXISTE', None)
+        code, result = call_api('POST', '/tasks_plan/', token, payload=preview_payload)
+        data = result.get('data') if isinstance(result, dict) else None
+        created_id = data.get('id') if isinstance(data, dict) else None
+        if code == 201 and created_id:
+            return ('CREADA', created_id)
+        # Never resubmit if successful-looking but response shape differs.
+        return ('AMBIGUA', code)
+    outcome, error = safe_api_action(write_once)
     if error:
         st.error(error)
-        st.info('No repitas la creación sin comprobar en Fracttal las tareas del plan. Si la API respondió con error, no se muestran datos sensibles.')
+        st.warning('No repitas la creación hasta revisar manualmente Fracttal.')
     else:
-        state, task_id, status = result
-        if state == 'EXISTE':
-            st.warning('La tarea ya existía. No se duplicó.')
+        state, detail = outcome
+        if state == 'CREADA':
+            st.success(f'Tarea creada, ID {detail}. Verifica en Fracttal sus activadores y subtareas.')
+        elif state == 'EXISTE':
+            st.warning('La tarea ya existe; no se envió un POST adicional.')
         else:
-            st.success(f'Tarea {state.lower()} (HTTP {status}); ID: {task_id}. Comprueba el activador por fecha en Fracttal; no se añadieron subtareas.')
-        st.session_state.pop('preflight', None)
+            st.warning(f'HTTP {detail} sin ID confirmado. Comprueba Fracttal antes de repetir.')
+    st.session_state.pop('preflight', None)
 
 st.divider()
 st.header('4 · Validar Excel y configurar correspondencias (SIN IMPORTAR)')
