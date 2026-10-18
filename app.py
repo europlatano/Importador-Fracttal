@@ -1,4 +1,4 @@
-"""Europlatano Fracttal test importer V6: diagnostics for task listing and guarded test-only writes."""
+"""Europlatano Fracttal test importer V7: configurable trigger preview and safe API validation diagnostics."""
 import io
 import json
 import hmac
@@ -12,10 +12,10 @@ TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
 TEST_TASK = 'PRUEBA API – INSPECCIÓN DE EJEMPLO (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V6', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V7', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 6 · Diagnóstico de consultas y prueba de UNA tarea · SIN ACTIVOS')
-st.warning('Versión de diagnóstico: distingue respuestas inesperadas de la API, permite revisar el plan de prueba y controla la creación de UNA tarea. NO importa el Excel completo.')
+st.caption('Europlátano · Versión 7 · Configurador de activadores y diagnóstico de errores · SIN ACTIVOS')
+st.warning('Versión 7: permite elegir tipos y configurar activadores Fecha/Evento, muestra previsualización y diagnostica respuestas HTTP 400 sin revelar secretos. Solo crea UNA tarea de prueba con confirmación. NO importa el Excel completo.')
 
 
 def setting(key):
@@ -63,6 +63,40 @@ def get_token():
     return token
 
 
+# Never show raw error bodies: upstream may echo credentials or sensitive input.
+# Only reveal names of known validation fields and whether a short, sanitized
+# error message can safely be extracted from structured validation responses.
+KNOWN_FIELDS = ('description', 'id_task_type_main', 'id_group_task', 'triggers',
+                'id_task_trigger_type', 'id_period_date', 'id_replay', 'value_main',
+                'value_end', 'id_event', 'event_description', 'subtasks',
+                'id_task_form_item_type', 'dropdown_options', 'id_unit',
+                'id_priorities', 'duration', 'resources', 'stop_assets_sec')
+
+
+def safe_error_details(parsed):
+    if not isinstance(parsed, dict):
+        return 'La respuesta no incluye un error estructurado interpretable.'
+    problems = set()
+    def walk(node, depth=0):
+        if depth > 4:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                for field in KNOWN_FIELDS:
+                    if str(key).casefold() == field.casefold():
+                        problems.add(field)
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node[:30]:
+                walk(value, depth + 1)
+    for key in ('errors', 'error', 'details', 'validation_errors'):
+        walk(parsed.get(key))
+    if problems:
+        return 'Campos mencionados en errores estructurados: ' + ', '.join(sorted(problems)) + '.'
+    return 'La API no identificó campos específicos en una estructura segura. Revisa tipos, activador y catálogos.'
+
+
 def call_api(method, endpoint, token, payload=None, params=None):
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     if payload is not None:
@@ -74,8 +108,8 @@ def call_api(method, endpoint, token, payload=None, params=None):
     except ValueError:
         parsed = {}
     if response.status_code >= 400 or (isinstance(parsed, dict) and parsed.get('success') is False):
-        # Prevent accidental display of raw server errors that could contain sensitive data.
-        raise ValueError(f'{method} {endpoint} rechazado (HTTP {response.status_code}). Consulta los permisos y catálogos.')
+        detail = safe_error_details(parsed)
+        raise ValueError(f'{method} {endpoint} rechazado (HTTP {response.status_code}). {detail}')
     return response.status_code, parsed
 
 
@@ -365,7 +399,60 @@ if preflight and preflight.get('plan_id') == st.session_state.get('test_plan_id'
 else:
     st.info('Primero pulsa «Diagnosticar listado y duplicados del plan».')
 
-st.caption('La prueba crea UNA tarea de EVENTO con DOS subtareas en el plan de prueba. Puede añadir un evento al catálogo. No vincula activos ni crea OT.')
+st.subheader('Configurador de activador para la tarea de prueba')
+st.caption('Fracttal exige al menos un activador. Elegir Fecha o Evento; esta versión no utiliza activadores de lectura.')
+trigger_kind = st.radio('Tipo de activador', ['Evento', 'Fecha'], horizontal=True, key='trigger_kind_v7')
+trigger_payload = None
+trigger_error = ''
+if trigger_kind == 'Evento':
+    event_name = st.text_input('Nombre del evento en Fracttal (existente o para resolver en el catálogo)',
+                               value=TEST_EVENT, max_chars=200, key='event_name_v7')
+    if len(event_name.strip()) < 3:
+        trigger_error = 'El nombre del evento debe tener al menos 3 caracteres.'
+    else:
+        trigger_payload = {'id_task_trigger_type': 4, 'event_description': event_name.strip()}
+    st.caption('Fracttal puede requerir que el evento esté registrado en su catálogo. No se garantiza que cree uno nuevo.')
+else:
+    freq_value = st.number_input('Repetir cada (cantidad)', min_value=1, max_value=10000, value=1, step=1, key='freq_v7')
+    freq_label = st.selectbox('Unidad orientativa', ['Semana', 'Mes', 'Día', 'Año'], key='freq_label_v7')
+    st.warning('La correspondencia entre unidades (Día/Semana/Mes/Año) y sus ID internos de Fracttal aún no está verificada. No adivinamos esos ID.')
+    freq_id = st.number_input('ID de periodicidad confirmado en Fracttal (id_period_date)',
+                              min_value=0, max_value=100000, value=0, step=1, key='freq_id_v7')
+    replay_id = st.selectbox('Modo de repetición (id_replay)', options=[1, 2], index=0,
+                             help='1 = modo básico usado en ejemplo oficial. 2 = repetir un número limitado de veces.', key='replay_v7')
+    max_runs = st.number_input('Número de repeticiones, si procede', min_value=1, max_value=10000, value=12,
+                                disabled=replay_id != 2, key='max_runs_v7')
+    if freq_id == 0:
+        trigger_error = 'Pendiente de confirmar el ID de periodicidad. No se permite crear una tarea de Fecha sin ese dato.'
+    else:
+        trigger_payload = {'id_task_trigger_type': 1, 'value_main': int(freq_value),
+                           'id_period_date': int(freq_id), 'id_replay': int(replay_id)}
+        if replay_id == 2:
+            trigger_payload['value_end'] = int(max_runs)
+    st.caption(f'Unidad seleccionada para revisar: {freq_label}. La API utiliza el ID interno indicado arriba.')
+
+st.subheader('Previsualización de la solicitud (sin claves)')
+if selected_key and st.session_state.get('test_plan_id') and trigger_payload:
+    preview_payload = {
+        'description': TEST_TASK, 'id_task_type_main': int(selected_key[1]),
+        'id_group_task': int(st.session_state.test_plan_id), 'id_priorities': 3,
+        'duration': 600, 'stop_assets_sec': 0,
+        'triggers': [trigger_payload],
+        'subtasks': [
+            {'description': 'Comprobar visualmente el estado general (solo prueba API)', 'id_task_form_item_type': 1, 'is_required': True},
+            {'description': 'Observaciones de prueba (sin datos confidenciales)', 'id_task_form_item_type': 1, 'is_required': False},
+        ],
+        'resources': [],
+    }
+    st.json(preview_payload, expanded=False)
+    st.caption('Los tipos de subtarea se envían como texto básico (ID 1) solo en esta prueba; otros formatos se validarán por separado.')
+else:
+    preview_payload = None
+    if trigger_error:
+        st.error(trigger_error)
+    st.info('Selecciona un tipo principal válido, localiza el plan y termina de configurar el activador para obtener una vista previa.')
+
+st.caption('La prueba crea UNA tarea con DOS subtareas en el plan de prueba. No vincula activos ni genera OT. El evento puede requerir configuración en el catálogo.')
 manual_override = bool(preflight and not preflight.get('listing_ok') and preflight.get('plan_count') == 0)
 if manual_override:
     verified_empty = st.checkbox('HE COMPROBADO en Fracttal que el plan de prueba tiene 0 tareas.', key='verified_empty')
@@ -375,22 +462,12 @@ ack_event = st.checkbox('Autorizo crear UNA tarea real de prueba (con dos subtar
 typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task_v6')
 preflight_good = bool(preflight and (preflight.get('listing_ok') and not preflight.get('existing') or manual_override and verified_empty))
 can_create_task = bool(ready and st.session_state.get('test_plan_id') and selected_key and ack_event
-                       and typed_task == 'CREAR TAREA PRUEBA' and preflight_good and not st.session_state.get('task_post_attempted'))
+                       and typed_task == 'CREAR TAREA PRUEBA' and preview_payload is not None and preflight_good and not st.session_state.get('task_post_attempted'))
 if st.button('🧪 Crear UNA tarea de prueba y dos subtareas', disabled=not can_create_task):
     st.session_state.task_post_attempted = True  # Never submit twice in one session.
     plan_id = int(st.session_state.test_plan_id)
     main_type_id = int(selected_key[1])
-    payload = {
-        'description': TEST_TASK,
-        'id_task_type_main': main_type_id,
-        'id_group_task': plan_id,
-        'triggers': [{'id_task_trigger_type': 4, 'event_description': TEST_EVENT}],
-        'subtasks': [
-            {'description': 'Comprobar visualmente el estado general (solo prueba API)', 'id_task_form_item_type': 4, 'is_required': True},
-            {'description': 'Observaciones de prueba (sin datos confidenciales)', 'id_task_form_item_type': 1, 'is_required': False},
-        ],
-        'resources': [],
-    }
+    payload = preview_payload
     def attempt_task_once():
         token = get_token()
         # Independent last-minute read; if it fails, use the user's explicit
