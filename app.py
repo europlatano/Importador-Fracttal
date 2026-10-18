@@ -1,570 +1,305 @@
-"""Europlatano Fracttal test importer V11: minimal DATE task test, stronger validation and empty-result handling."""
+"""Europlátano · V12 | staged Fracttal task-plan importer.
+No asset linking, deleting, OT creation or editing. Two-stage task/subtask writes.
+"""
 import io
 import json
 import hmac
+import hashlib
 import requests
 import pandas as pd
 import streamlit as st
 
-API = 'https://app.fracttal.com/api'
-TOKEN_URL = 'https://one.fracttal.com/oauth/token'
-TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
-TEST_TASK = 'PRUEBA API – EVENTO V11 (NO OPERATIVA)'
-TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
-
-st.set_page_config(page_title='Importador Fracttal · V11', page_icon='🛠️', layout='wide')
+API='https://app.fracttal.com/api'
+TOKEN_URL='https://one.fracttal.com/oauth/token'
+TYPES={'Texto':1, 'Verificación':4, 'Lista':7}
+st.set_page_config(page_title='Importador Fracttal V12', page_icon='🛠️',layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 11 · Activador por EVENTO · SIN ACTIVOS')
-st.warning('Versión 11: UNA sola tarea de prueba (Activador por EVENTO). No importa Excel ni vincula activos. Solo después de verificar el contenido de la solicitud.')
+st.caption('Europlátano · V12 · Excel → plan → tareas → subtareas · SIN vincular activos')
+st.warning('IMPORTACIÓN REAL Y CONTROLADA. Elige una tarea y confirma cada escritura. Los activos se vinculan MANUALMENTE en Fracttal.')
 
+def secret(key):
+    try:return str(st.secrets.get(key,'')).strip()
+    except Exception:return ''
 
-def setting(key):
-    try:
-        value = st.secrets.get(key, '')
-        return str(value).strip() if value is not None else ''
-    except Exception:
-        return ''
-
-password = setting('APP_PASSWORD')
-if not password:
-    st.error('Configura APP_PASSWORD en Settings → Secrets de Streamlit.')
-    st.stop()
-if not st.session_state.get('authenticated', False):
-    with st.form('login'):
-        entered = st.text_input('Contraseña del importador', type='password')
-        submitted = st.form_submit_button('Entrar')
-    if submitted:
-        if hmac.compare_digest(entered, password):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error('Contraseña incorrecta.')
+pw=secret('APP_PASSWORD')
+if not pw:st.error('Configura APP_PASSWORD en Secrets.');st.stop()
+if not st.session_state.get('logged'):
+    with st.form('auth'):
+        entered=st.text_input('Contraseña del importador',type='password')
+        submit=st.form_submit_button('Entrar')
+    if submit:
+        if hmac.compare_digest(entered,pw):st.session_state.logged=True;st.rerun()
+        else:st.error('Contraseña incorrecta')
     st.stop()
 with st.sidebar:
     st.success('Sesión protegida')
     if st.button('Cerrar sesión'):
-        st.session_state.authenticated = False
-        st.rerun()
-    st.caption('No guardes secretos en GitHub ni los muestres en capturas.')
+        st.session_state.logged=False;st.rerun()
+    st.caption('No captures ni compartas secretos OAuth.')
 
-client_id = setting('FRACTTAL_CLIENT_ID')
-client_secret = setting('FRACTTAL_CLIENT_SECRET')
-ready = bool(client_id and client_secret)
+client_id,client_secret=secret('FRACTTAL_CLIENT_ID'),secret('FRACTTAL_CLIENT_SECRET')
+ready=bool(client_id and client_secret)
 
+def token():
+    r=requests.post(TOKEN_URL,auth=(client_id,client_secret),data={'grant_type':'client_credentials'},timeout=25)
+    if r.status_code!=200:raise RuntimeError(f'OAuth HTTP {r.status_code}')
+    t=r.json().get('access_token')
+    if not t:raise RuntimeError('Token OAuth ausente')
+    return t
 
-def get_token():
-    response = requests.post(TOKEN_URL, auth=(client_id, client_secret),
-                             data={'grant_type': 'client_credentials'}, timeout=22)
-    if response.status_code != 200:
-        raise ValueError(f'OAuth rechazado (HTTP {response.status_code}).')
-    token = response.json().get('access_token')
-    if not token:
-        raise ValueError('OAuth no devolvió access_token.')
-    return token
+# Errors deliberately contain no upstream body, which could echo tenant fields.
+def api(method,path,t,payload=None,params=None):
+    hdr={'Authorization':f'Bearer {t}','Accept':'application/json'}
+    if payload is not None:hdr['Content-Type']='application/json'
+    r=requests.request(method,API+path,headers=hdr,json=payload,params=params,timeout=35)
+    try:data=r.json()
+    except ValueError:data={}
+    if r.status_code>=400 or (isinstance(data,dict) and data.get('success') is False):
+        raise RuntimeError(f'{method} {path}: HTTP {r.status_code}. Revisa registros en Fracttal antes de repetir.')
+    return r.status_code,data
 
-
-# Never show raw error bodies: upstream may echo credentials or sensitive input.
-# Only reveal names of known validation fields and whether a short, sanitized
-# error message can safely be extracted from structured validation responses.
-KNOWN_FIELDS = ('description', 'id_task_type_main', 'id_group_task', 'triggers',
-                'id_task_trigger_type', 'id_period_date', 'id_replay', 'value_main',
-                'value_end', 'id_event', 'event_description', 'subtasks',
-                'id_task_form_item_type', 'dropdown_options', 'id_unit',
-                'id_priorities', 'duration', 'resources', 'stop_assets_sec')
-
-
-def safe_error_details(parsed):
-    if not isinstance(parsed, dict):
-        return 'La respuesta no incluye un error estructurado interpretable.'
-    problems = set()
-    def walk(node, depth=0):
-        if depth > 4:
-            return
-        if isinstance(node, dict):
-            for key, value in node.items():
-                for field in KNOWN_FIELDS:
-                    if str(key).casefold() == field.casefold():
-                        problems.add(field)
-                if isinstance(value, (dict, list)):
-                    walk(value, depth + 1)
-        elif isinstance(node, list):
-            for value in node[:30]:
-                walk(value, depth + 1)
-    for key in ('errors', 'error', 'details', 'validation_errors'):
-        walk(parsed.get(key))
-    if problems:
-        return 'Campos mencionados en errores estructurados: ' + ', '.join(sorted(problems)) + '.'
-    return 'La API no identificó campos específicos en una estructura segura. Revisa tipos, activador y catálogos.'
-
-
-def call_api(method, endpoint, token, payload=None, params=None):
-    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
-    if payload is not None:
-        headers['Content-Type'] = 'application/json'
-    response = requests.request(method, API + endpoint, headers=headers,
-                                json=payload, params=params, timeout=28)
-    try:
-        parsed = response.json()
-    except ValueError:
-        parsed = {}
-    if response.status_code >= 400 or (isinstance(parsed, dict) and parsed.get('success') is False):
-        detail = safe_error_details(parsed)
-        raise ValueError(f'{method} {endpoint} rechazado (HTTP {response.status_code}). {detail}')
-    return response.status_code, parsed
-
-
-def fetch_all_plans(token):
-    """Scan every reported page, fail closed if pagination cannot be verified."""
-    found = []
-    for offset in range(0, 10000, 100):
-        _, response = call_api('GET', '/groups_tasks/', token,
-                               params={'start': offset, 'limit': 100})
-        rows = response.get('data')
-        if not isinstance(rows, list):
-            raise ValueError('La API no devolvió una lista de planes.')
-        found.extend(rows)
-        total = response.get('total')
+def rows_of(resp,source):
+    data=resp.get('data') if isinstance(resp,dict) else None
+    if isinstance(data,list):return data
+    if data is None and isinstance(resp,dict) and resp.get('success') is True:
         try:
-            total_int = int(total) if total is not None else None
-        except (TypeError, ValueError):
-            total_int = None
-        if (total_int is not None and len(found) >= total_int) or len(rows) < 100:
-            return found
-    raise ValueError('No se completó la revisión de todos los planes. Se bloquea la creación.')
+            if int(resp.get('total'))==0:return []
+        except (ValueError,TypeError):pass
+    raise RuntimeError(f'La consulta de {source} no devolvió lista verificable. Escritura BLOQUEADA.')
 
+def paginated(t,path,params=None):
+    found=[]
+    for offset in range(0,20000,100):
+        p=dict(params or {},start=offset,limit=100)
+        _,ans=api('GET',path,t,params=p)
+        page=rows_of(ans,path)
+        if any(not isinstance(item,dict) for item in page):raise RuntimeError('La consulta contiene registros inesperados.')
+        found.extend(page)
+        try:total=int(ans.get('total'))
+        except (ValueError,TypeError):total=None
+        if (total is not None and len(found)>=total) or len(page)<100:return found
+    raise RuntimeError('Paginación incompleta; escritura bloqueada.')
 
-def matching_test_plans(rows):
-    return [p for p in rows if str(p.get('description', '')).strip().casefold() == TEST_PLAN.casefold()]
+def plans(t):return paginated(t,'/groups_tasks/')
+def tasks(t,pid):
+    vals=paginated(t,'/tasks/',{'id_group_task':int(pid)})
+    if any(str(x.get('id_group_task'))!=str(pid) for x in vals):raise RuntimeError('Filtro de plan no respetado; escritura bloqueada.')
+    return vals
 
+def subtasks(t,tid):
+    vals=paginated(t,'/tasks_subtasks/',{'id_task':int(tid)})
+    if any(str(x.get('id_task'))!=str(tid) for x in vals):raise RuntimeError('Filtro de tarea no respetado; escritura bloqueada.')
+    return vals
 
-def safe_api_action(fn):
-    try:
-        return fn(), None
-    except requests.Timeout:
-        return None, 'La API tardó demasiado. NO repitas la creación sin consultar antes si ya se creó el registro.'
-    except requests.RequestException:
-        return None, 'Fallo de red. NO repitas la creación hasta consultar Fracttal.'
-    except (ValueError, TypeError, KeyError) as exc:
-        return None, str(exc)
+def match(rows,name):
+    return [x for x in rows if str(x.get('description','')).strip().casefold()==name.strip().casefold()]
 
-st.header('1 · Conexión y revisión de duplicados')
-st.write('Credenciales guardadas en Streamlit:', '✅ Configuradas' if ready else '❌ Pendientes')
+def fmt_error(ex):
+    if isinstance(ex,requests.Timeout):return 'Tiempo de espera agotado. Comprueba Fracttal ANTES de repetir.'
+    if isinstance(ex,requests.RequestException):return 'Error de red. Comprueba Fracttal ANTES de repetir.'
+    return str(ex)
 
-if st.button('🔗 Consultar planes existentes (solo lectura)', disabled=not ready):
-    def load_plans():
-        token = get_token()
-        return fetch_all_plans(token)
-    plans, error = safe_api_action(load_plans)
-    if error:
-        st.error(error)
-        st.session_state.pop('verified_plans', None)
-    else:
-        st.session_state.verified_plans = plans
-        st.success('Consulta correcta. Ningún registro modificado.')
-        st.metric('Planes consultados', len(plans))
-        duplicates = matching_test_plans(plans)
-        st.info(f'Planes con el nombre de prueba: {len(duplicates)}')
-
-st.divider()
-st.header('2 · Crear un plan de prueba (sin activos)')
-st.code(TEST_PLAN, language=None)
-st.caption('Se creará un plan nuevo sin localización ni activos. No se crean órdenes de trabajo ni se toca ningún equipo.')
-st.info('Solo para probar los permisos de creación. No se importará todavía el plan Reisopack.')
-confirm_plan = st.checkbox('Entiendo que esta acción CREARÁ un registro real de prueba en Fracttal.', key='confirm_plan')
-typed_plan = st.text_input('Para autorizarlo, escribe exactamente CREAR PLAN PRUEBA', key='typed_plan')
-can_create_plan = ready and confirm_plan and typed_plan == 'CREAR PLAN PRUEBA'
-
-if st.button('🧪 Crear plan de prueba en Fracttal', disabled=not can_create_plan, type='primary'):
-    def create_test_plan():
-        token = get_token()
-        existing = matching_test_plans(fetch_all_plans(token))
-        if existing:
-            return 'EXISTE', existing[0].get('id')
-        status, result = call_api('POST', '/groups_tasks/', token, payload={'description': TEST_PLAN})
-        if status != 201 or not result.get('data', {}).get('id'):
-            raise ValueError('Respuesta de creación sin confirmación suficiente. Comprueba Fracttal antes de repetir.')
-        return 'CREADO', result['data']['id']
-    outcome, error = safe_api_action(create_test_plan)
-    if error:
-        st.error(error)
-    else:
-        state, plan_id = outcome
-        st.session_state.test_plan_id = int(plan_id)
-        if state == 'CREADO':
-            st.success(f'Plan de prueba creado correctamente. ID: {plan_id}. Sin activos vinculados.')
-        else:
-            st.warning(f'El plan de prueba ya existía (ID: {plan_id}); no se ha duplicado.')
-
-st.divider()
-st.header('3 · Elegir tipo de tarea y probar UNA tarea')
-st.info('Consulta tipos observados en las tareas existentes y elige el nombre e ID exactos. Esto es una lista observada, NO el catálogo completo de tipos configurados en Fracttal.')
-
-
-def response_shape(value):
-    """Safe structural metadata only: never show full API response contents."""
-    if isinstance(value, dict):
-        return {'tipo': 'objeto', 'claves': sorted(str(k) for k in value.keys())[:20],
-                'tipo_data': type(value.get('data')).__name__,
-                'tipo_total': type(value.get('total')).__name__}
-    if isinstance(value, list):
-        return {'tipo': 'lista', 'elementos': len(value)}
-    return {'tipo': type(value).__name__}
-
-
-def extract_task_rows(response):
-    """Recognize only defensible task collection structures, with no false empty lists."""
-    if isinstance(response, list):
-        return response, None
-    if not isinstance(response, dict):
-        raise ValueError('Respuesta GET /tasks/ inesperada: ' + json.dumps(response_shape(response), ensure_ascii=False))
-    if isinstance(response.get('data'), list):
-        return response['data'], response.get('total')
-    # Fracttal may encode a legitimately empty collection as data=null, total=0.
-    # Never interpret data=null as empty unless success is explicit and total == 0.
-    if response.get('data') is None and response.get('success') is True:
-        try:
-            if int(response.get('total')) == 0:
-                return [], 0
-        except (TypeError, ValueError):
-            pass
-    nested = response.get('data')
-    if isinstance(nested, dict):
-        for key in ('data', 'tasks', 'items', 'results'):
-            if isinstance(nested.get(key), list):
-                return nested[key], nested.get('total', response.get('total'))
-    for key in ('tasks', 'items', 'results'):
-        if isinstance(response.get(key), list):
-            return response[key], response.get('total')
-    raise ValueError('GET /tasks/ no devolvió una colección reconocible. Estructura: '
-                     + json.dumps(response_shape(response), ensure_ascii=False))
-
-
-def fetch_tasks(token, group_id=None):
-    """Read tasks, do not assume successful HTTP implies a list."""
-    found = []
-    for offset in range(0, 30000, 100):
-        params = {'start': offset, 'limit': 100}
-        if group_id is not None:
-            params['id_group_task'] = int(group_id)
-        status, response = call_api('GET', '/tasks/', token, params=params)
-        try:
-            rows, raw_total = extract_task_rows(response)
-        except ValueError as exc:
-            raise ValueError(f'{exc} (HTTP {status}, offset {offset}).') from exc
-        if not all(isinstance(item, dict) for item in rows):
-            raise ValueError('GET /tasks/ contiene registros que no son objetos. Creación bloqueada.')
-        found.extend(rows)
-        try:
-            total = int(raw_total) if raw_total is not None else None
-        except (TypeError, ValueError):
-            total = None
-        if (total is not None and len(found) >= total) or len(rows) < 100:
-            return found
-        if rows and offset > 0 and rows == found[-200:-100]:
-            raise ValueError('La paginación de tareas repitió resultados; consulta incompleta.')
-    raise ValueError('Se excedió límite de paginación (30.000 tareas); creación bloqueada.')
-
-
-def exact_tasks_in_plan(token, plan_id):
-    """Ensure server filter has actually been respected."""
-    rows = fetch_tasks(token, group_id=plan_id)
-    mismatched = [r for r in rows if str(r.get('id_group_task', '')) != str(plan_id)]
-    if mismatched:
-        raise ValueError('GET /tasks/ devolvió tareas ajenas al plan solicitado; se bloquea la operación.')
-    return rows
-
-
-def preventive_type_ids(tasks):
-    """Infer existing principal type IDs from Fracttal task records, not guessed API paths."""
-    seen = {}
-    for row in tasks:
-        label = str(row.get('tasks_types_main_description') or '').strip().casefold()
-        raw_id = row.get('id_task_type_main')
-        if 'preventiv' not in label or not raw_id:
-            continue
-        try:
-            value = int(raw_id)
-        except (ValueError, TypeError):
-            continue
-        if value > 0:
-            seen[value] = seen.get(value, 0) + 1
-    return seen
-
-
-def find_id_plan():
-    plans, error = safe_api_action(lambda: fetch_all_plans(get_token()))
-    if error:
-        return None, error
-    matches = matching_test_plans(plans)
-    if len(matches) != 1:
-        return None, f'Se esperaban exactamente 1 plan de prueba; encontrados: {len(matches)}.'
-    return int(matches[0]['id']), None
-
-def observed_type_options(tasks):
-    """Read-only list of distinct (exact label, ID) tuples in existing task records."""
-    observed = {}
-    for row in tasks:
-        if not isinstance(row, dict):
-            continue
-        name = str(row.get('tasks_types_main_description') or '').strip()
-        raw = row.get('id_task_type_main')
-        if not name or raw is None:
-            continue
-        try:
-            task_type_id = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if task_type_id <= 0:
-            continue
-        key = (name, task_type_id)
-        observed[key] = observed.get(key, 0) + 1
-    return observed
-
-
-left, right = st.columns(2)
-with left:
-    if st.button('🔎 Localizar plan de prueba', disabled=not ready):
-        plan_id_found, error = find_id_plan()
-        if error:
-            st.error(error)
-            st.session_state.pop('test_plan_id', None)
-        else:
-            st.session_state.test_plan_id = plan_id_found
-            st.session_state.pop('preflight', None)
-            st.success(f'Plan de prueba localizado. ID: {plan_id_found}')
-with right:
-    if st.button('🔎 Consultar tipos utilizados en Fracttal', disabled=not ready):
-        found_tasks, error = safe_api_action(lambda: fetch_tasks(get_token()))
-        if error:
-            st.error(error)
-            st.session_state.pop('observed_types', None)
-        else:
-            options = observed_type_options(found_tasks)
-            st.session_state.observed_types = options
-            st.session_state.tasks_scanned = len(found_tasks)
-            if options:
-                st.success(f'Se observaron {len(options)} combinaciones de nombre e ID en {len(found_tasks)} tareas.')
-            else:
-                st.warning('No se encontraron tipos con ID y nombre. No es posible seleccionar un tipo.')
-
-st.write('Plan de prueba:', st.session_state.get('test_plan_id', 'Pendiente'))
-observed = st.session_state.get('observed_types', {})
-selected_key = None
-if observed:
-    st.caption('Solo se muestran tipos presentes en las tareas consultadas. Se conservan diferencias de MAYÚSCULAS, minúsculas y sus ID. La lista no demuestra que el catálogo esté completo.')
-    ordered = sorted(observed, key=lambda pair: (pair[0].casefold(), pair[0], pair[1]))
-    selected_key = st.selectbox('Tipo principal para la tarea de prueba (nombre exacto + ID)',
-                                options=ordered, index=None, placeholder='Elige un tipo de tarea…',
-                                format_func=lambda key: f'{key[0]}  ·  ID {key[1]}  ·  {observed[key]} tarea(s) observadas',
-                                key='test_type_selection_v8')
-    if selected_key:
-        st.success(f'Tipo elegido manualmente: {selected_key[0]} (ID {selected_key[1]}).')
-        if 'preventiv' not in selected_key[0].casefold():
-            st.warning('Has elegido un tipo distinto de Preventivo. La tarea de prueba usará exactamente el tipo seleccionado.')
-else:
-    st.info('Pulsa «Consultar tipos utilizados en Fracttal» para activar el desplegable.')
-
-st.subheader('Diagnóstico previo, en solo lectura')
-st.caption('Este diagnóstico identifica si el GET de tareas funciona o qué estructura devuelve. No cambia Fracttal.')
-if st.button('🔍 Diagnosticar listado y duplicados del plan', disabled=not (ready and st.session_state.get('test_plan_id'))):
-    def diagnose():
-        token = get_token()
-        plan_id = int(st.session_state.test_plan_id)
-        plans = matching_test_plans(fetch_all_plans(token))
-        if len(plans) != 1 or int(plans[0].get('id', -1)) != plan_id:
-            raise ValueError('No se verificó un único plan de prueba. No se permite crear.')
-        plan_count = plans[0].get('task_number')
-        try:
-            plan_count = int(plan_count)
-        except (TypeError, ValueError):
-            plan_count = None
-        try:
-            rows = exact_tasks_in_plan(token, plan_id)
-            return {'listing_ok': True, 'count': len(rows), 'existing': [r for r in rows if str(r.get('description','')).strip().casefold() == TEST_TASK.casefold()],
-                    'plan_count': plan_count, 'plan_id': plan_id}
-        except ValueError as exc:
-            return {'listing_ok': False, 'error': str(exc), 'plan_count': plan_count, 'plan_id': plan_id}
-    outcome, error = safe_api_action(diagnose)
-    if error:
-        st.error(error)
-        st.session_state.pop('preflight', None)
-    else:
-        st.session_state.preflight = outcome
-
-preflight = st.session_state.get('preflight')
-if preflight and preflight.get('plan_id') == st.session_state.get('test_plan_id'):
-    if preflight['listing_ok']:
-        st.success(f'GET /tasks/ correcto. Tareas en este plan: {preflight["count"]}.')
-        if preflight['existing']:
-            st.error('La tarea de prueba YA EXISTE: no se permite repetir.')
-    else:
-        st.warning('No se pudo interpretar el listado de tareas. ' + preflight['error'])
-        st.info(f'En la ficha del plan, Fracttal informa de {preflight["plan_count"] if preflight["plan_count"] is not None else "un número desconocido de"} tarea(s).')
-        if preflight['plan_count'] == 0:
-            st.warning('La lista de tareas falló, pero el plan comunica 0 tareas. Se permite una prueba EXCEPCIONAL solo si lo confirmas en la interfaz de Fracttal.')
-        else:
-            st.error('No se permite crear sin un listado fiable ni confirmación de 0 tareas.')
-else:
-    st.info('Primero pulsa «Diagnosticar listado y duplicados del plan».')
-
-st.subheader('Prueba controlada V11: Activador por EVENTO')
-st.info('Prueba independiente con un nombre nuevo. Mantiene la estructura de FECHA que funcionó en V8, salvo V11 que prueba EVENTO. No modifica tareas anteriores.')
-import copy
-period_id = st.number_input('ID de periodicidad (confirmar con V8)', min_value=1, max_value=100000, value=2, step=1, key='period_v11')
-period_value = st.number_input('Cada cuántos períodos', min_value=1, max_value=365, value=1, step=1, key='value_v11')
-subtasks_payload = []
-st.warning('EVENTO: asegúrate de utilizar una descripción de evento que Fracttal reconozca. El servidor puede rechazar un nombre ausente de catálogo.')
-event_name = st.text_input('Descripción EXACTA del evento en Fracttal', value=TEST_EVENT, key='event_name_v11')
-trigger_payload = {'id_task_trigger_type': 4, 'event_description': event_name.strip()}
-st.subheader('Previsualización del POST (sin secretos)')
-plan_id = st.session_state.get('test_plan_id')
-preview_payload = None
-if selected_key and plan_id:
-    preview_payload = {
-        'description': TEST_TASK,
-        'id_task_type_main': int(selected_key[1]),
-        'id_group_task': int(plan_id),
-        'triggers': [trigger_payload],
-        'subtasks': subtasks_payload,
-    }
-    st.json(preview_payload, expanded=True)
-else:
-    st.info('Primero localiza el plan y elige un tipo principal de tarea.')
-
-# No trust in stale preflight after post; duplicate protection runs immediately before POST.
-preflight = st.session_state.get('preflight')
-preflight_good = bool(preflight and preflight.get('plan_id') == plan_id and preflight.get('listing_ok') and not preflight.get('existing'))
-if preflight and preflight.get('listing_ok') and preflight.get('existing'):
-    st.error('Ya existe la tarea de esta versión. Se bloquea otro intento.')
-if preflight and not preflight.get('listing_ok'):
-    st.warning('No se pudo consultar las tareas del plan. NO se hará POST hasta obtener una consulta fiable. No se usa excepción manual.')
-confirmed = st.checkbox('HE COMPROBADO en Fracttal que esta tarea concreta NO existe y entiendo que se creará un registro real.', key='confirm_unique_v11')
-authorized = st.checkbox('Autorizo UNA tarea real de prueba sin activos ni OT.', key='confirm_write_v11')
-phrase = st.text_input('Escribe CREAR TAREA PRUEBA para confirmar', key='phrase_v11')
-can_post = bool(ready and preview_payload and preflight_good and confirmed and authorized and phrase == 'CREAR TAREA PRUEBA' and not st.session_state.get('attempted_v11'))
-if st.button('🧪 Crear tarea de prueba V11', disabled=not can_post):
-    st.session_state.attempted_v11 = True
-    def write_once():
-        token = get_token()
-        # Repeat duplicate check at write time; do not trust an old UI result.
-        current = exact_tasks_in_plan(token, int(plan_id))
-        if any(str(item.get('description', '')).strip().casefold() == TEST_TASK.casefold() for item in current):
-            return ('EXISTE', None)
-        code, result = call_api('POST', '/tasks_plan/', token, payload=preview_payload)
-        data = result.get('data') if isinstance(result, dict) else None
-        created_id = data.get('id') if isinstance(data, dict) else None
-        if code == 201 and created_id:
-            return ('CREADA', created_id)
-        # Never resubmit if successful-looking but response shape differs.
-        return ('AMBIGUA', code)
-    outcome, error = safe_api_action(write_once)
-    if error:
-        st.error(error)
-        st.warning('No repitas la creación hasta revisar manualmente Fracttal.')
-    else:
-        state, detail = outcome
-        if state == 'CREADA':
-            st.success(f'Tarea creada, ID {detail}. Verifica en Fracttal sus activadores y subtareas.')
-        elif state == 'EXISTE':
-            st.warning('La tarea ya existe; no se envió un POST adicional.')
-        else:
-            st.warning(f'HTTP {detail} sin ID confirmado. Comprueba Fracttal antes de repetir.')
-    st.session_state.pop('preflight', None)
-
-st.divider()
-st.header('4 · Validar Excel y configurar correspondencias (SIN IMPORTAR)')
-uploaded = st.file_uploader('Selecciona la plantilla Excel (.xlsx)', type=['xlsx'])
-if uploaded is None:
-    st.info('Carga el Excel para revisar su estructura. Los activos se asociarán MANUALMENTE después de importar los planes.')
+st.header('1 · Archivo Excel')
+f=st.file_uploader('Carga el Excel de mantenimiento (.xlsx)',type=['xlsx'])
+if f is None:
+    st.info('Selecciona la plantilla Reisopack 2904 para empezar. No se realizan cambios en Fracttal al cargarla.')
     st.stop()
+raw=f.getvalue();file_hash=hashlib.sha256(raw).hexdigest()
 try:
-    workbook = pd.read_excel(io.BytesIO(uploaded.getvalue()), sheet_name=None, dtype=str, keep_default_na=False)
+    book=pd.read_excel(io.BytesIO(raw),sheet_name=None,dtype=str,keep_default_na=False)
 except Exception:
-    st.error('No se pudo leer el archivo .xlsx.')
-    st.stop()
-required = {
-    'PLANES': ['ID_PLAN', 'NOMBRE_PLAN'],
-    'TAREAS': ['ID_TAREA', 'ID_PLAN', 'NOMBRE_TAREA', 'ACTIVADOR'],
-    'SUBTAREAS': ['ID_TAREA', 'ORDEN', 'TIPO_SUBTAREA', 'DESCRIPCION'],
-}
-errors = []
-for sheet, columns in required.items():
-    if sheet not in workbook:
-        errors.append(f'Falta la hoja {sheet}.')
-    else:
-        errors.extend(f'Falta columna {col} en hoja {sheet}.' for col in columns if col not in workbook[sheet].columns)
-if errors:
-    st.error(' '.join(errors))
-    st.stop()
-plans, tasks, subtasks = (workbook[k].copy() for k in ('PLANES', 'TAREAS', 'SUBTAREAS'))
-if plans.ID_PLAN.duplicated().any() or tasks.ID_TAREA.duplicated().any():
-    errors.append('IDs de plan o tarea duplicados.')
-if set(tasks.ID_PLAN) - set(plans.ID_PLAN):
-    errors.append('Tareas con plan inexistente.')
-if set(subtasks.ID_TAREA) - set(tasks.ID_TAREA):
-    errors.append('Subtareas con tarea inexistente.')
-if not subtasks.empty and subtasks[['ID_TAREA', 'ORDEN']].duplicated().any():
-    errors.append('Órdenes de subtarea duplicados.')
-if set(tasks.ACTIVADOR) - {'Fecha', 'Evento'}:
-    errors.append('Activadores no reconocidos.')
-for label, count in [('Planes', len(plans)), ('Tareas', len(tasks)), ('Subtareas', len(subtasks)), ('Incidencias', len(errors))]:
-    st.metric(label, count)
-if errors:
-    st.error('; '.join(errors))
+    st.error('No se pudo abrir el Excel.');st.stop()
+required={'PLANES':['ID_PLAN','NOMBRE_PLAN'],'TAREAS':['ID_TAREA','ID_PLAN','NOMBRE_TAREA','TIPO_INICIAL','ACTIVADOR','INTERVALO','UNIDAD_INTERVALO'], 'SUBTAREAS':['ID_TAREA','ORDEN','TIPO_SUBTAREA','GRUPO_PARTE','DESCRIPCION','OBLIGATORIA','ADJUNTO_OBLIGATORIO']}
+problems=[]
+for sh,cols in required.items():
+    if sh not in book:problems.append(f'Falta hoja {sh}')
+    else:problems.extend(f'Falta {sh}.{c}' for c in cols if c not in book[sh].columns)
+if problems:st.error(' / '.join(problems));st.stop()
+ps,ts,ss=book['PLANES'].copy(),book['TAREAS'].copy(),book['SUBTAREAS'].copy()
+for df in [ps,ts,ss]:df.fillna('',inplace=True)
+if ps['ID_PLAN'].duplicated().any():problems.append('IDs de plan duplicados')
+if ts['ID_TAREA'].duplicated().any():problems.append('IDs de tarea duplicados')
+if set(ts.ID_PLAN)-set(ps.ID_PLAN):problems.append('Tareas sin plan')
+if set(ss.ID_TAREA)-set(ts.ID_TAREA):problems.append('Subtareas sin tarea')
+if ss[['ID_TAREA','ORDEN']].duplicated().any():problems.append('Órdenes duplicados por tarea')
+for i,r in ts.iterrows():
+    if r.ACTIVADOR not in ('Fecha','Evento'):problems.append(f'{r.ID_TAREA}: activador inválido')
+    if len(str(r.NOMBRE_TAREA).strip())<3 or len(str(r.NOMBRE_TAREA))>200:problems.append(f'{r.ID_TAREA}: nombre incorrecto')
+    if r.ACTIVADOR=='Fecha':
+        try:
+            if int(r.INTERVALO)<1:raise ValueError
+        except (ValueError,TypeError):problems.append(f'{r.ID_TAREA}: intervalo no válido')
+        if not str(r.UNIDAD_INTERVALO).strip():problems.append(f'{r.ID_TAREA}: falta unidad')
+for i,r in ss.iterrows():
+    if r.TIPO_SUBTAREA not in TYPES:problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: tipo desconocido')
+    if not str(r.GRUPO_PARTE).strip():problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: falta Grupo/Parte')
+    if not str(r.DESCRIPCION).strip():problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: falta descripción')
+    if str(r.OBLIGATORIA).strip().casefold() not in ('sí','si','no'):problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: OBLIGATORIA inválida')
+    if str(r.ADJUNTO_OBLIGATORIO).strip().casefold() not in ('sí','si','no'):problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: ADJUNTO_OBLIGATORIO inválido')
+    if r.TIPO_SUBTAREA=='Lista' and len([v for v in str(r.get('OPCIONES_RESPUESTA','')).split('|') if v.strip()])<2:problems.append(f'Lista {r.ID_TAREA}-{r.ORDEN}: faltan opciones')
+    try:
+        if int(r.ORDEN)<1:raise ValueError
+    except (ValueError,TypeError):problems.append(f'Subtarea {r.ID_TAREA}-{r.ORDEN}: orden inválido')
+a,b,c,d=st.columns(4)
+for widget,label,num in zip((a,b,c,d),('Planes','Tareas','Subtareas','Incidencias'),(len(ps),len(ts),len(ss),len(problems))):widget.metric(label,num)
+if problems:
+    st.error('Errores de validación:');st.write(problems);st.stop()
+st.success('Estructura del Excel validada. Los campos Grupo/Parte y Adjunto obligatorio serán incluidos al crear subtareas.')
+if len(ps)!=1:
+    st.error('V12 trabaja con un único plan por archivo para evitar confusiones.');st.stop()
+plan_name=str(ps.iloc[0]['NOMBRE_PLAN']).strip()
+with st.expander('Ver tareas y subtareas'):
+    st.dataframe(ts,use_container_width=True,hide_index=True)
+    st.dataframe(ss,use_container_width=True,hide_index=True)
+
+st.header('2 · Conexión y correspondencias')
+if not ready:
+    st.error('Faltan FRACTTAL_CLIENT_ID o FRACTTAL_CLIENT_SECRET en Secrets de Streamlit.');st.stop()
+if st.button('🔗 Consultar tipos y planes de Fracttal (solo lectura)'):
+    try:
+        t=token();all_plans=plans(t);observed=paginated(t,'/tasks/')
+        options=sorted({(str(r.get('tasks_types_main_description','')).strip(),int(r['id_task_type_main'])) for r in observed if r.get('tasks_types_main_description') and str(r.get('id_task_type_main','')).isdigit()},key=lambda x:(x[0].casefold(),x[1]))
+        st.session_state.v12_types=options
+        st.session_state.v12_plans=all_plans
+        st.success(f'Consulta correcta: {len(all_plans)} planes y {len(options)} tipos observados.')
+    except Exception as exc:st.error(fmt_error(exc))
+choices=st.session_state.get('v12_types',[])
+if not choices:st.info('Pulsa «Consultar tipos y planes» para cargar los desplegables.');st.stop()
+selected_types={}
+for name in sorted(set(ts.TIPO_INICIAL)):
+    select=st.selectbox(f'Tipo del Excel: {name} → Fracttal',options=[None]+choices,format_func=lambda x:'— Elige tipo —' if x is None else f'{x[0]} (ID {x[1]})',key='map_'+name)
+    if select:selected_types[name]=select
+if len(selected_types)!=len(set(ts.TIPO_INICIAL)):
+    st.warning('Selecciona un tipo principal para todas las clasificaciones del Excel.');st.stop()
+
+st.subheader('Configurar períodos y eventos')
+st.caption('Los ID de periodicidad no se adivinan. Selecciona explícitamente el ID correcto de tu Fracttal, comprobado previamente en una tarea. La V8 funcionó con el ID 2, pero no confirma por sí sola la unidad de cada fila.')
+period_map={}
+for unit in sorted(set(ts.loc[ts.ACTIVADOR=='Fecha','UNIDAD_INTERVALO'])):
+    period_map[unit]=st.number_input(f'ID de periodicidad en Fracttal para «{unit}»',min_value=0,max_value=10000, value=0,step=1,key='period_'+unit)
+    st.caption(f'Confirma en Fracttal que el ID indicado corresponde a {unit}.')
+if any(v==0 for v in period_map.values()):st.warning('Pendiente asignar los ID de periodicidad. Las tareas por evento siguen disponibles para previsualizar.')
+events={}
+for _,r in ts[ts.ACTIVADOR=='Evento'].iterrows():
+    events[r.ID_TAREA]=st.text_input(f'Evento para {r.ID_TAREA}: {r.NOMBRE_TAREA}',value=str(r.NOMBRE_TAREA),key='ev_'+r.ID_TAREA)
+
+st.header('3 · Elegir plan y tarea')
+found=match(st.session_state.get('v12_plans',[]),plan_name)
+if len(found)>1:st.error('Existen varios planes con el mismo nombre. Se bloquea la importación.');st.stop()
+if found:
+    plan_id=int(found[0]['id']);st.success(f'Plan ya existente: {plan_name} · ID {plan_id}')
 else:
-    st.success('Validación estructural del Excel correcta. No confirma aún equivalencia de catálogos API.')
-for label, table in [('Planes', plans), ('Tareas', tasks), ('Subtareas', subtasks)]:
-    with st.expander(f'{label} ({len(table)})', expanded=label == 'Tareas'):
-        st.dataframe(table, use_container_width=True, hide_index=True)
-st.subheader('Correspondencias: tipo del Excel → tipo observado en Fracttal')
-st.caption('Selecciona por separado la clasificación de Fracttal para cada valor TIPO_INICIAL del Excel. La elección es explícita; nunca se asigna por similitud. Esta versión solo guarda las correspondencias en un JSON descargable: NO IMPORTA EL EXCEL.')
-if 'TIPO_INICIAL' not in tasks.columns:
-    st.warning('No hay columna TIPO_INICIAL en TAREAS. Para configurar correspondencias, añádela en la plantilla.')
+    st.warning('El plan no existe en los resultados consultados. Puedes crearlo antes de importar las tareas.')
+    st.code(plan_name,language=None)
+    ok=st.checkbox('Confirmo crear este plan REAL sin vincular activos.')
+    phrase=st.text_input('Escribe CREAR PLAN para autorizar',key='create_plan_phrase')
+    if st.button('Crear plan en Fracttal',disabled=not(ok and phrase=='CREAR PLAN')):
+        try:
+            t=token();fresh=match(plans(t),plan_name)
+            if fresh:st.warning('Plan ya existe. Actualiza consulta.');st.stop()
+            code,response=api('POST','/groups_tasks/',t,{'description':plan_name})
+            st.success(f'Petición enviada (HTTP {code}). Comprueba el nuevo plan y vuelve a consultar. No repitas la creación.')
+            st.session_state.v12_plans=plans(t)
+        except Exception as exc:st.error(fmt_error(exc))
+    st.stop()
+
+labels=[f'{r.ID_TAREA} · {r.NOMBRE_TAREA}' for _,r in ts.iterrows()]
+choice=st.selectbox('Selecciona UNA tarea que quieras importar',range(len(labels)),format_func=lambda i:labels[i])
+r=ts.iloc[choice]
+subrows=ss[ss.ID_TAREA==r.ID_TAREA].copy()
+subrows['_order']=subrows.ORDEN.astype(int)
+subrows=subrows.sort_values('_order')
+
+def yes(value):return str(value).strip().casefold() in ('sí','si')
+
+def mk_sub(row):
+    result={'description':str(row.DESCRIPCION).strip(), 'id_task_form_item_type':TYPES[row.TIPO_SUBTAREA], 'is_required':yes(row.OBLIGATORIA),'attachments_required':yes(row.ADJUNTO_OBLIGATORIO),'task_form_item_group_description':str(row.GRUPO_PARTE).strip()}
+    if row.TIPO_SUBTAREA=='Lista':result['dropdown_options']=[{'description':x.strip()} for x in str(row.get('OPCIONES_RESPUESTA','')).split('|') if x.strip()]
+    return result
+
+payload={'description':str(r.NOMBRE_TAREA).strip(),'id_task_type_main':selected_types[r.TIPO_INICIAL][1],'id_group_task':plan_id,'triggers':[]}
+if r.ACTIVADOR=='Fecha':
+    val=period_map.get(r.UNIDAD_INTERVALO,0)
+    if val:payload['triggers']=[{'id_task_trigger_type':1,'value_main':int(r.INTERVALO),'id_period_date':val,'id_replay':1}]
 else:
-    unique_names = sorted({str(value).strip() for value in tasks['TIPO_INICIAL'] if str(value).strip()}, key=str.casefold)
-    if not unique_names:
-        st.warning('No hay tipos de tarea en el Excel.')
-    elif not observed:
-        st.info('Para configurar correspondencias, primero pulsa «Consultar tipos utilizados en Fracttal» en el apartado 3.')
-    else:
-        mapping = {}
-        imported_mapping = {}
-        prior = st.file_uploader('Recuperar correspondencias desde un JSON anterior (opcional)', type=['json'], key='mapping_json')
-        if prior is not None:
-            try:
-                raw = json.loads(prior.getvalue().decode('utf-8'))
-                if not isinstance(raw, dict) or raw.get('schema') != 'fracttal-tipo-correspondencias-v1' or not isinstance(raw.get('mapping'), dict):
-                    raise ValueError('Formato no reconocido')
-                imported_mapping = raw['mapping']
-                st.success('JSON de correspondencias leído. Revisa las selecciones antes de utilizarlo.')
-            except (ValueError, UnicodeError):
-                st.error('JSON inválido. No se aplicaron correspondencias.')
-        choices = sorted(observed, key=lambda pair: (pair[0].casefold(), pair[0], pair[1]))
-        for excel_name in unique_names:
-            saved = imported_mapping.get(excel_name, {})
-            default_pair = None
-            if isinstance(saved, dict):
-                try:
-                    candidate = (str(saved.get('label', '')), int(saved.get('id', 0)))
-                    if candidate in choices:
-                        default_pair = candidate
-                except (TypeError, ValueError):
-                    pass
-            options_with_blank = [None] + choices
-            index = options_with_blank.index(default_pair) if default_pair else 0
-            selected = st.selectbox(f'Excel: «{excel_name}» → Fracttal:', options=options_with_blank,
-                                    index=index, key=f'map_excel_{excel_name}',
-                                    format_func=lambda opt: '— Selecciona un tipo —' if opt is None else f'{opt[0]} · ID {opt[1]} ({observed[opt]} tarea(s))')
-            if selected is not None:
-                mapping[excel_name] = {'label': selected[0], 'id': selected[1]}
-        missing = sorted(set(unique_names) - set(mapping))
-        if missing:
-            st.warning('Correspondencias pendientes: ' + ', '.join(missing))
+    payload['triggers']=[{'id_task_trigger_type':4,'event_description':events[r.ID_TAREA].strip()}]
+try:payload['duration']=max(60,int(r.get('ESTIMACION_MIN','') or '10')*60)
+except (ValueError,TypeError):payload['duration']=600
+subs=[mk_sub(row) for _,row in subrows.iterrows()]
+st.write(f'**{len(subs)} subtareas**, {r.ACTIVADOR}, **sin activos**. Grupo/Parte y adjuntos se enviarán con cada subtarea.')
+with st.expander('Vista previa de tarea (POST /tasks_plan/)',expanded=False):st.json(payload)
+with st.expander('Vista previa de subtareas (POST /tasks_subtasks/)',expanded=False):st.json({'id_task':'<se obtendrá al crear tarea>','is_cyclical':False,'subtasks':subs})
+
+st.subheader('Comprobación de duplicados (solo lectura)')
+if st.button('🔎 Consultar tareas y subtareas del plan'):
+    try:
+        t=token();existing=match(tasks(t,plan_id),payload['description'])
+        st.session_state.v12_check=(file_hash,plan_id,r.ID_TAREA,existing)
+        if len(existing)>1:st.error('Más de una tarea con el mismo nombre. Se bloquea la importación.')
+        elif len(existing)==1:
+            st.info(f'La tarea YA existe (ID {existing[0]["id"]}). No se duplicará. Puedes verificar si le faltan subtareas.')
+        else:st.success('No existe una tarea con este nombre en el plan. Lista para prueba de creación.')
+    except Exception as exc:
+        st.session_state.pop('v12_check',None);st.error(fmt_error(exc))
+
+check=st.session_state.get('v12_check')
+check_valid=bool(check and check[:3]==(file_hash,plan_id,r.ID_TAREA))
+existing=check[3] if check_valid else None
+
+st.subheader('4 · Ejecutar un paso controlado')
+st.caption('El proceso se divide en dos operaciones: 1) crear tarea con activador y 2) añadir subtareas con su Grupo/Parte y adjunto obligatorio. Así utilizamos el endpoint que admite nombres de Grupo/Parte. Si algo falla, NO repetimos automáticamente.')
+confirm=st.checkbox('He comprobado los datos y entiendo que se modificará Fracttal.',key='v12_confirm')
+phrase=st.text_input('Escribe IMPORTAR TAREA para autorizar',key='v12_phrase')
+allowed=bool(confirm and phrase=='IMPORTAR TAREA' and check_valid)
+
+if existing is not None and len(existing)>1:st.error('Duplicidad de tareas, bloqueado.');st.stop()
+if existing is not None and len(existing)==0:
+    if st.button('1️⃣ Crear solo ESTA tarea (sin subtareas)',disabled=not (allowed and payload['triggers'])):
+        try:
+            t=token()
+            current=match(tasks(t,plan_id),payload['description'])
+            if current:st.warning('Tarea ya existente, no se creó otra. Vuelve a consultar.')
+            else:
+                code,out=api('POST','/tasks_plan/',t,payload)
+                data=out.get('data') if isinstance(out,dict) else None
+                ident=data.get('id') if isinstance(data,dict) else None
+                st.session_state.pop('v12_check',None)
+                if ident:st.success(f'Tarea creada (ID {ident}). Ahora pulsa Consultar tareas y subtareas para habilitar el paso 2.')
+                else:st.warning(f'HTTP {code} sin ID verificable. Comprueba Fracttal y vuelve a consultar; NO repitas la escritura.')
+        except Exception as exc:
+            st.session_state.pop('v12_check',None);st.error(fmt_error(exc))
+            st.warning('Verifica si la tarea existe en Fracttal antes de cualquier nuevo intento.')
+
+if existing is not None and len(existing)==1:
+    tid=int(existing[0]['id'])
+    if st.button('🔎 Verificar subtareas existentes de ESTA tarea'):
+        try:
+            existing_subs=subtasks(token(),tid)
+            st.session_state.v12_subcheck=(file_hash,plan_id,r.ID_TAREA,tid,existing_subs)
+            st.success(f'Subtareas existentes: {len(existing_subs)}')
+        except Exception as exc:
+            st.session_state.pop('v12_subcheck',None);st.error(fmt_error(exc))
+    subcheck=st.session_state.get('v12_subcheck')
+    if subcheck and subcheck[:4]==(file_hash,plan_id,r.ID_TAREA,tid):
+        old=subcheck[4]
+        if old:
+            st.warning(f'Hay {len(old)} subtarea(s) en la tarea. No se permiten cargas automáticas adicionales para evitar duplicaciones o mezclar órdenes. Comprueba manualmente.')
         else:
-            st.success('Todas las correspondencias del Excel tienen un tipo seleccionado.')
-        export = {'schema': 'fracttal-tipo-correspondencias-v1', 'mapping': mapping}
-        st.download_button('💾 Descargar correspondencias (.json)', data=json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
-                           file_name='correspondencias_tipos_fracttal.json', mime='application/json', disabled=bool(missing))
-        st.caption('Guarda el JSON en Archivos de tu iPad para reutilizarlo. No contiene claves OAuth ni contraseñas.')
-st.button('Importar el Excel completo (pendiente de implementar)', disabled=True)
-st.caption('No se asocian activos desde este importador. La asociación se hará a mano en Fracttal.')
+            st.success('La tarea NO tiene subtareas. Se puede crear el bloque completo una sola vez.')
+            if st.button('2️⃣ Crear todas las subtareas de ESTA tarea',disabled=not(allowed and len(subs)>0)):
+                try:
+                    t=token()
+                    fresh=match(tasks(t,plan_id),payload['description'])
+                    if len(fresh)!=1 or int(fresh[0]['id'])!=tid:raise RuntimeError('La tarea cambió. Escritura bloqueada.')
+                    if subtasks(t,tid):raise RuntimeError('Ya hay subtareas. Escritura bloqueada.')
+                    code,out=api('POST','/tasks_subtasks/',t,{'id_task':tid,'is_cyclical':False,'subtasks':subs})
+                    st.session_state.pop('v12_subcheck',None)
+                    st.session_state.pop('v12_check',None)
+                    st.success(f'Petición de subtareas enviada (HTTP {code}). Comprueba cada Grupo/Parte, lista y adjunto obligatorio en Fracttal.')
+                    st.info('No repetir. Vuelve a consultar tareas y subtareas para confirmar.')
+                except Exception as exc:
+                    st.session_state.pop('v12_subcheck',None)
+                    st.error(fmt_error(exc));st.warning('Comprueba Fracttal antes de repetir; puede haber una escritura parcial.')
+
+st.divider()
+st.caption('V12 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
