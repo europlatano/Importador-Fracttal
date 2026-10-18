@@ -1,4 +1,4 @@
-"""Europlatano Fracttal test importer V10: minimal DATE task test, stronger validation and empty-result handling."""
+"""Europlatano Fracttal test importer V11: minimal DATE task test, stronger validation and empty-result handling."""
 import io
 import json
 import hmac
@@ -9,13 +9,13 @@ import streamlit as st
 API = 'https://app.fracttal.com/api'
 TOKEN_URL = 'https://one.fracttal.com/oauth/token'
 TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
-TEST_TASK = 'PRUEBA API – FECHA TRES FORMATOS V10 (NO OPERATIVA)'
+TEST_TASK = 'PRUEBA API – EVENTO V11 (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V10', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V11', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 10 · Verificación, Lista y Texto · SIN ACTIVOS')
-st.warning('Versión 10: UNA sola tarea de prueba (Verificación, Lista y Texto). No importa Excel ni vincula activos. Solo después de verificar el contenido de la solicitud.')
+st.caption('Europlátano · Versión 11 · Activador por EVENTO · SIN ACTIVOS')
+st.warning('Versión 11: UNA sola tarea de prueba (Activador por EVENTO). No importa Excel ni vincula activos. Solo después de verificar el contenido de la solicitud.')
 
 
 def setting(key):
@@ -407,14 +407,15 @@ if preflight and preflight.get('plan_id') == st.session_state.get('test_plan_id'
 else:
     st.info('Primero pulsa «Diagnosticar listado y duplicados del plan».')
 
-st.subheader('Prueba controlada V10: Verificación, Lista y Texto')
+st.subheader('Prueba controlada V11: Activador por EVENTO')
 st.info('Prueba independiente con un nombre nuevo. Mantiene la estructura de FECHA que funcionó en V8, salvo V11 que prueba EVENTO. No modifica tareas anteriores.')
 import copy
-period_id = st.number_input('ID de periodicidad (confirmar con V8)', min_value=1, max_value=100000, value=2, step=1, key='period_v10')
-period_value = st.number_input('Cada cuántos períodos', min_value=1, max_value=365, value=1, step=1, key='value_v10')
-subtasks_payload = [{"description": "Estado general (prueba)", "id_task_form_item_type": 4, "is_required": True, "attachments_required": False}, {"description": "¿Quién ha realizado la intervención?", "id_task_form_item_type": 7, "dropdown_options": [{"description": "Interno"}, {"description": "Externo"}, {"description": "Mixto"}], "is_required": True, "attachments_required": False}, {"description": "Observaciones (prueba)", "id_task_form_item_type": 1, "is_required": False, "attachments_required": False}]
-trigger_payload = {'id_task_trigger_type': 1, 'value_main': int(period_value), 'id_period_date': int(period_id), 'id_replay': 1}
-st.caption('Se usa activador por FECHA para aislar la prueba. El ID de periodicidad debe coincidir con el que funcionó en V8.')
+period_id = st.number_input('ID de periodicidad (confirmar con V8)', min_value=1, max_value=100000, value=2, step=1, key='period_v11')
+period_value = st.number_input('Cada cuántos períodos', min_value=1, max_value=365, value=1, step=1, key='value_v11')
+subtasks_payload = []
+st.warning('EVENTO: asegúrate de utilizar una descripción de evento que Fracttal reconozca. El servidor puede rechazar un nombre ausente de catálogo.')
+event_name = st.text_input('Descripción EXACTA del evento en Fracttal', value=TEST_EVENT, key='event_name_v11')
+trigger_payload = {'id_task_trigger_type': 4, 'event_description': event_name.strip()}
 st.subheader('Previsualización del POST (sin secretos)')
 plan_id = st.session_state.get('test_plan_id')
 preview_payload = None
@@ -437,12 +438,12 @@ if preflight and preflight.get('listing_ok') and preflight.get('existing'):
     st.error('Ya existe la tarea de esta versión. Se bloquea otro intento.')
 if preflight and not preflight.get('listing_ok'):
     st.warning('No se pudo consultar las tareas del plan. NO se hará POST hasta obtener una consulta fiable. No se usa excepción manual.')
-confirmed = st.checkbox('HE COMPROBADO en Fracttal que esta tarea concreta NO existe y entiendo que se creará un registro real.', key='confirm_unique_v10')
-authorized = st.checkbox('Autorizo UNA tarea real de prueba sin activos ni OT.', key='confirm_write_v10')
-phrase = st.text_input('Escribe CREAR TAREA PRUEBA para confirmar', key='phrase_v10')
-can_post = bool(ready and preview_payload and preflight_good and confirmed and authorized and phrase == 'CREAR TAREA PRUEBA' and not st.session_state.get('attempted_v10'))
-if st.button('🧪 Crear tarea de prueba V10', disabled=not can_post):
-    st.session_state.attempted_v10 = True
+confirmed = st.checkbox('HE COMPROBADO en Fracttal que esta tarea concreta NO existe y entiendo que se creará un registro real.', key='confirm_unique_v11')
+authorized = st.checkbox('Autorizo UNA tarea real de prueba sin activos ni OT.', key='confirm_write_v11')
+phrase = st.text_input('Escribe CREAR TAREA PRUEBA para confirmar', key='phrase_v11')
+can_post = bool(ready and preview_payload and preflight_good and confirmed and authorized and phrase == 'CREAR TAREA PRUEBA' and not st.session_state.get('attempted_v11'))
+if st.button('🧪 Crear tarea de prueba V11', disabled=not can_post):
+    st.session_state.attempted_v11 = True
     def write_once():
         token = get_token()
         # Repeat duplicate check at write time; do not trust an old UI result.
