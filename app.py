@@ -11,10 +11,10 @@ TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
 TEST_TASK = 'PRUEBA API – INSPECCIÓN DE EJEMPLO (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V3', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V4', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 3 · Prueba de escritura controlada SIN ASOCIAR ACTIVOS')
-st.warning('Esta versión permite crear SOLO un plan de PRUEBA y, por separado, una tarea de PRUEBA. La importación masiva del Excel aún NO está habilitada.')
+st.caption('Europlátano · Versión 4 · Detección del tipo Preventivo y prueba controlada SIN ACTIVOS')
+st.warning('Esta versión permite buscar el ID de Preventivo a partir de tareas existentes y crear, tras confirmación, SOLO una tarea de PRUEBA. No importa el Excel completo.')
 
 
 def setting(key):
@@ -72,7 +72,7 @@ def call_api(method, endpoint, token, payload=None, params=None):
         parsed = response.json()
     except ValueError:
         parsed = {}
-    if response.status_code >= 400 or parsed.get('success') is False:
+    if response.status_code >= 400 or (isinstance(parsed, dict) and parsed.get('success') is False):
         # Prevent accidental display of raw server errors that could contain sensitive data.
         raise ValueError(f'{method} {endpoint} rechazado (HTTP {response.status_code}). Consulta los permisos y catálogos.')
     return response.status_code, parsed
@@ -161,10 +161,47 @@ if st.button('🧪 Crear plan de prueba en Fracttal', disabled=not can_create_pl
             st.warning(f'El plan de prueba ya existía (ID: {plan_id}); no se ha duplicado.')
 
 st.divider()
-st.header('3 · Crear una tarea mínima de prueba (opcional)')
-st.write('La creación de tareas requiere un **ID numérico del tipo principal de tarea** existente en vuestro catálogo.')
-st.warning('**No adivinaremos el ID.** Si no conoces el ID de Preventivo, deja esta sección pendiente. En una próxima revisión podremos resolverlo con el catálogo.')
-st.caption('Si se realiza la prueba, se creará una tarea con activador por evento. Fracttal puede crear también una entrada en el catálogo de eventos. No se asignarán activos.')
+st.header('3 · Localizar tipo Preventivo y probar una tarea')
+st.info('Primero buscamos el identificador de Preventivo leyendo tareas YA EXISTENTES. No alteramos catálogos ni adivinamos IDs. Solo crearemos algo tras confirmación expresa.')
+
+
+def fetch_tasks(token, group_id=None):
+    """Paginate full listing; filter by plan on server for duplicate check."""
+    found = []
+    for offset in range(0, 30000, 100):
+        params = {'start': offset, 'limit': 100}
+        if group_id is not None:
+            params['id_group_task'] = int(group_id)
+        _, response = call_api('GET', '/tasks/', token, params=params)
+        rows = response.get('data') if isinstance(response, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError('La API no devolvió una lista de tareas.')
+        found.extend(rows)
+        try:
+            total = int(response.get('total')) if response.get('total') is not None else None
+        except (TypeError, ValueError):
+            total = None
+        if (total is not None and len(found) >= total) or len(rows) < 100:
+            return found
+    raise ValueError('No se pudo recorrer todo el catálogo de tareas. Se bloquea la creación.')
+
+
+def preventive_type_ids(tasks):
+    """Infer existing principal type IDs from Fracttal task records, not guessed API paths."""
+    seen = {}
+    for row in tasks:
+        label = str(row.get('tasks_types_main_description') or '').strip().casefold()
+        raw_id = row.get('id_task_type_main')
+        if 'preventiv' not in label or not raw_id:
+            continue
+        try:
+            value = int(raw_id)
+        except (ValueError, TypeError):
+            continue
+        if value > 0:
+            seen[value] = seen.get(value, 0) + 1
+    return seen
+
 
 def find_id_plan():
     plans, error = safe_api_action(lambda: fetch_all_plans(get_token()))
@@ -175,30 +212,56 @@ def find_id_plan():
         return None, f'Se esperaban exactamente 1 plan de prueba; encontrados: {len(matches)}.'
     return int(matches[0]['id']), None
 
-if st.button('🔎 Localizar plan de prueba para añadir una tarea', disabled=not ready):
-    plan_id, error = find_id_plan()
-    if error:
-        st.error(error)
-    else:
-        st.session_state.test_plan_id = plan_id
-        st.success(f'Plan de prueba encontrado. ID: {plan_id}')
+left, right = st.columns(2)
+with left:
+    if st.button('🔎 Localizar plan de prueba', disabled=not ready):
+        plan_id_found, error = find_id_plan()
+        if error:
+            st.error(error)
+            st.session_state.pop('test_plan_id', None)
+        else:
+            st.session_state.test_plan_id = plan_id_found
+            st.success(f'Plan de prueba localizado. ID: {plan_id_found}')
+with right:
+    if st.button('🔎 Buscar ID de Preventivo automáticamente', disabled=not ready):
+        found_tasks, error = safe_api_action(lambda: fetch_tasks(get_token()))
+        if error:
+            st.error(error)
+            st.session_state.pop('preventive_type_id', None)
+        else:
+            seen = preventive_type_ids(found_tasks)
+            st.session_state.pop('preventive_type_id', None)
+            st.session_state['preventive_candidates'] = seen
+            st.session_state['tasks_scanned'] = len(found_tasks)
+            if len(seen) == 1:
+                st.session_state.preventive_type_id = next(iter(seen))
+                st.success(f'Preventivo localizado: ID {st.session_state.preventive_type_id}. Identificado en {len(found_tasks)} tareas existentes.')
+            elif not seen:
+                st.warning('No se encontró ningún registro cuya clasificación principal contenga «Preventivo». No se utilizará un ID supuesto.')
+            else:
+                st.error('Se encontraron varios IDs asociados a Preventivo. Se bloquea la creación hasta revisar esta discrepancia.')
 
-plan_id = st.session_state.get('test_plan_id')
-st.write('Plan de prueba identificado:', str(plan_id) if plan_id else 'Pendiente')
-task_main_type = st.number_input('ID del tipo principal de tarea (confirmado en Fracttal)', min_value=0, step=1, value=0)
-ack_event = st.checkbox('Entiendo que se creará una tarea y posiblemente un evento en el catálogo.', key='ack_event')
-typed_task = st.text_input('Para autorizar, escribe CREAR TAREA PRUEBA', key='typed_task')
-if st.button('🧪 Crear una sola tarea de prueba',
-             disabled=not (ready and plan_id and task_main_type > 0 and ack_event and typed_task == 'CREAR TAREA PRUEBA')):
-    # Repeated POST may duplicate tasks: one attempt only in this session, never auto-retry.
+st.write('Plan de prueba:', st.session_state.get('test_plan_id', 'Pendiente'))
+st.write('Tipo principal Preventivo:', st.session_state.get('preventive_type_id', 'Pendiente'))
+if st.session_state.get('preventive_candidates'):
+    st.caption('IDs observados en tareas existentes (ID: número de registros): ' + ', '.join(f'{k}: {v}' for k,v in sorted(st.session_state.preventive_candidates.items())))
+
+st.caption('La prueba crea una sola tarea de EVENTO dentro del plan de prueba. Puede incorporar una entrada en el catálogo de eventos. No vincula activos, no importa planes reales y no crea órdenes de trabajo.')
+ack_event = st.checkbox('Autorizo crear UNA tarea de prueba real en el plan de prueba, sin activos.', key='ack_event')
+typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task')
+can_create_task = bool(ready and st.session_state.get('test_plan_id') and st.session_state.get('preventive_type_id') and ack_event and typed_task == 'CREAR TAREA PRUEBA')
+if st.button('🧪 Crear una sola tarea de prueba', disabled=not can_create_task):
     if st.session_state.get('task_post_attempted'):
-        st.error('Ya se intentó crear la tarea en esta sesión. Verifica Fracttal antes de cualquier nuevo intento.')
+        st.error('Ya se intentó crear en esta sesión. Verifica Fracttal y evita repetir la operación.')
     else:
+        # Set before any network call to avoid duplicate writes on rerun/timeout.
         st.session_state.task_post_attempted = True
+        plan_id = int(st.session_state.test_plan_id)
+        main_type_id = int(st.session_state.preventive_type_id)
         payload = {
             'description': TEST_TASK,
-            'id_task_type_main': int(task_main_type),
-            'id_group_task': int(plan_id),
+            'id_task_type_main': main_type_id,
+            'id_group_task': plan_id,
             'triggers': [{'id_task_trigger_type': 4, 'event_description': TEST_EVENT}],
             'subtasks': [
                 {'description': 'Comprobar visualmente el estado general (solo prueba API)', 'id_task_form_item_type': 4, 'is_required': True},
@@ -206,18 +269,33 @@ if st.button('🧪 Crear una sola tarea de prueba',
             ],
             'resources': [],
         }
-        def create_task():
+        def attempt_task_once():
             token = get_token()
-            status, result = call_api('POST', '/tasks_plan/', token, payload=payload)
-            if status != 201 or not result.get('data', {}).get('id'):
-                raise ValueError('La respuesta no confirmó el ID de la tarea. Comprueba Fracttal; no reintentes a ciegas.')
-            return result['data']
-        result, error = safe_api_action(create_task)
+            prior = [row for row in fetch_tasks(token, group_id=plan_id)
+                     if str(row.get('description', '')).strip().casefold() == TEST_TASK.casefold()]
+            if prior:
+                return 'EXISTE', None
+            status, response = call_api('POST', '/tasks_plan/', token, payload=payload)
+            if status == 201 and isinstance(response, dict):
+                task_data = response.get('data')
+                if isinstance(task_data, dict) and task_data.get('id'):
+                    return 'CREADA', task_data['id']
+            # Might have persisted despite unexpected success response. Verify with GET, never resend POST.
+            verified = [row for row in fetch_tasks(token, group_id=plan_id)
+                        if str(row.get('description', '')).strip().casefold() == TEST_TASK.casefold()]
+            if len(verified) == 1:
+                return 'VERIFICADA', verified[0].get('id')
+            raise ValueError('Resultado de creación no confirmado. Revisa la tarea en Fracttal; no reintentes.')
+        result, error = safe_api_action(attempt_task_once)
         if error:
             st.error(error)
-            st.info('Si recibes HTTP 400, probablemente falte validar el ID de tipo o el evento. Si es 403, revisa el permiso ADD en Plan de tareas del grupo addon.')
+            st.info('No vuelvas a crearla sin revisar el plan en Fracttal. Los permisos ADD sobre Plan de tareas también deben estar habilitados.')
         else:
-            st.success(f'Tarea de prueba creada. ID: {result["id"]}. Confirma en Fracttal el activador y las 2 subtareas.')
+            state, created_id = result
+            if state == 'EXISTE':
+                st.warning('La tarea ya existe en el plan de prueba. No se duplicó.')
+            else:
+                st.success(f'Tarea de prueba {state.lower()}. ID: {created_id}. Comprueba en Fracttal sus 2 subtareas y su activador por evento.')
 
 st.divider()
 st.header('4 · Validar Excel Reisopack (SIN IMPORTAR)')
