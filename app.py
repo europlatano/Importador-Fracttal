@@ -13,10 +13,10 @@ import streamlit as st
 API='https://app.fracttal.com/api'
 TOKEN_URL='https://one.fracttal.com/oauth/token'
 TYPES={'Texto':1, 'Verificación':4, 'Lista':7}
-st.set_page_config(page_title='Importador Fracttal V16', page_icon='🛠️',layout='wide')
+st.set_page_config(page_title='Importador Fracttal AUTOMÁTICO', page_icon='🛠️',layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · V16 · diagnóstico real API · Excel → tarea → subtareas · SIN activos')
-st.warning('IMPORTACIÓN REAL Y CONTROLADA. Primero inspecciona el diagnóstico. Nunca reintentes automáticamente una escritura; los activos se vinculan MANUALMENTE.')
+st.caption('Europlátano · Importador automático por Excel · SIN activos · tipos y frecuencias precargados')
+st.info('Los tipos y frecuencias proceden del Excel. Revisa un resumen global y autoriza una vez. No se vinculan activos ni se crean OT.')
 
 def secret(key):
     try:return str(st.secrets.get(key,'')).strip()
@@ -192,233 +192,356 @@ with st.expander('Ver tareas y subtareas'):
     st.dataframe(ts,use_container_width=True,hide_index=True)
     st.dataframe(ss,use_container_width=True,hide_index=True)
 
-st.header('2 · Conexión y correspondencias')
-if not ready:
-    st.error('Faltan FRACTTAL_CLIENT_ID o FRACTTAL_CLIENT_SECRET en Secrets de Streamlit.');st.stop()
-if st.button('🔗 Consultar tipos y planes de Fracttal (solo lectura)'):
+
+# -------- IMPORTACION AUTOMATICA CONSOLIDADA --------
+import unicodedata
+
+def norm(value):
+    return ''.join(c for c in unicodedata.normalize('NFD', str(value).casefold().strip()) if unicodedata.category(c) != 'Mn')
+
+def unit_name(value):
+    v=norm(value)
+    map_names={'days':'Día','day':'Día','dia':'Día','dias':'Día','daily':'Día',
+               'weeks':'Semana','week':'Semana','semana':'Semana','semanas':'Semana',
+               'months':'Mes','month':'Mes','mes':'Mes','meses':'Mes',
+               'years':'Año','year':'Año','ano':'Año','anos':'Año'}
+    return map_names.get(v)
+
+def positive_int(v):
     try:
-        t=token();all_plans=plans(t);observed=paginated(t,'/tasks/')
-        options=sorted({(str(r.get('tasks_types_main_description','')).strip(),int(r['id_task_type_main'])) for r in observed if r.get('tasks_types_main_description') and str(r.get('id_task_type_main','')).isdigit()},key=lambda x:(x[0].casefold(),x[1]))
-        st.session_state.v12_types=options
-        st.session_state.v12_plans=all_plans
-        st.success(f'Consulta correcta: {len(all_plans)} planes y {len(options)} tipos observados.')
-    except Exception as exc:st.error(fmt_error(exc))
-choices=st.session_state.get('v12_types',[])
-if not choices:st.info('Pulsa «Consultar tipos y planes» para cargar los desplegables.');st.stop()
-selected_types={}
-for name in sorted(set(ts.TIPO_INICIAL)):
-    select=st.selectbox(f'Tipo del Excel: {name} → Fracttal',options=[None]+choices,format_func=lambda x:'— Elige tipo —' if x is None else f'{x[0]} (ID {x[1]})',key='map_'+name)
-    if select:selected_types[name]=select
-if len(selected_types)!=len(set(ts.TIPO_INICIAL)):
-    st.warning('Selecciona un tipo principal para todas las clasificaciones del Excel.');st.stop()
+        z=int(v)
+        return z if z > 0 else None
+    except (ValueError,TypeError):return None
 
-st.subheader('Configurar períodos y eventos')
-st.info('Selecciona las frecuencias por su NOMBRE. El importador solo las habilita si obtiene una correspondencia verificable desde Fracttal. Nunca presupone los códigos internos.')
-
-# En esta versión únicamente se aceptan correspondencias de periodicidad respaldadas
-# por la descripción de unidad devuelta en la respuesta de Fracttal.
-def normaliza_unidad(valor):
-    raw=str(valor or '').strip().casefold()
-    known={'days':'Día','day':'Día','días':'Día','día':'Día','dias':'Día',
-           'weeks':'Semana','week':'Semana','semanas':'Semana','semana':'Semana',
-           'months':'Mes','month':'Mes','meses':'Mes','mes':'Mes',
-           'years':'Año','year':'Año','años':'Año','año':'Año'}
-    return known.get(raw, '')
-
-with st.expander('🔎 Consultar frecuencias existentes (solo lectura)', expanded=True):
-    st.caption('Buscamos referencias reales de Fracttal para relacionar Semana y Mes con sus códigos. Si la API no devuelve unidades identificables, se bloquearán las tareas por fecha, pero podrás trabajar con las de Evento.')
-    if st.button('Consultar frecuencias de Fracttal (SOLO LECTURA)'):
+def discover_freq(t):
+    records=[]
+    # Consultas de solo lectura: el nombre y el ID deben proceder del MISMO registro.
+    # No deducimos los IDs por el orden del desplegable visual.
+    for path in ('/tasks_triggers/',):
         try:
-            sample=paginated(token(),'/tasks_triggers/')
-            refs=[]
-            for row in sample:
-                if not isinstance(row,dict):continue
-                try:pid=int(row.get('id_period_date'))
-                except (TypeError,ValueError):continue
-                name=''
-                for key in ('period_dates_description','period_date_description','period_description','period_date','period_dates'):
-                    if isinstance(row.get(key),str) and row[key].strip():name=row[key].strip();break
-                label=normaliza_unidad(name)
-                if label:
-                    refs.append({'ID':pid,'Frecuencia':label,'Nombre original':name,'Tarea':row.get('id_task') or row.get('id_tasks')})
-            st.session_state.v14_refs=refs
-            if refs:st.success(f'Referencias verificables encontradas: {len(refs)}.')
-            else:st.warning('La API no devolvió referencias verificables de unidades de periodicidad. No se asignarán números por suposición.')
+            for r in paginated(t,path):
+                if not isinstance(r,dict):continue
+                pid=positive_int(r.get('id_period_date'))
+                if not pid:continue
+                for key in ('period_dates_description','period_date_description','period_description',
+                            'period_date','period_dates','frequency_description'):
+                    if r.get(key) and isinstance(r.get(key),str):
+                        unit=unit_name(r[key])
+                        if unit:
+                            records.append({'Unidad':unit,'ID':pid,'Fuente':path})
+                        break
         except Exception:
-            st.session_state.v14_refs=[]
-            st.warning('La API no ha proporcionado el catálogo de frecuencias mediante esta consulta. No se ha modificado Fracttal.')
-    refs=st.session_state.get('v14_refs',[])
-    if refs:
-        st.dataframe(pd.DataFrame(refs)[['Frecuencia','Nombre original','ID','Tarea']].drop_duplicates(),hide_index=True,use_container_width=True)
+            continue
+    mapping={}
+    for name in ('Día','Semana','Mes','Año'):
+        ids={r['ID'] for r in records if r['Unidad']==name}
+        if len(ids)==1:mapping[name]=ids.pop()
+    return records,mapping
 
-period_map={}
-for excel_unit in sorted(set(ts.loc[ts.ACTIVADOR=='Fecha','UNIDAD_INTERVALO'])):
-    label=normaliza_unidad(excel_unit)
-    candidates=sorted({r['ID'] for r in st.session_state.get('v14_refs',[]) if r['Frecuencia']==label})
-    if not label:
-        st.error(f'Frecuencia del Excel no reconocida: {excel_unit!r}.')
-        period_map[excel_unit]=0
-    elif len(candidates)==1:
-        st.success(f'{excel_unit} → {label} (referencia identificada en Fracttal).')
-        accepted=st.checkbox(f'Confirmo utilizar la frecuencia «{label}» para las tareas del Excel',key='v14_accepted_'+excel_unit)
-        period_map[excel_unit]=candidates[0] if accepted else 0
-    elif len(candidates)>1:
-        st.warning(f'Fracttal ha devuelto varios códigos para «{label}». No se selecciona ninguno automáticamente.')
-        st.caption('Es necesario verificar el catálogo con soporte de Fracttal antes de importar por fecha.')
-        period_map[excel_unit]=0
-    else:
-        st.warning(f'No hay referencia comprobada para «{label}». Las tareas por fecha que utilicen esa frecuencia permanecerán deshabilitadas.')
-        period_map[excel_unit]=0
-if any(x==0 for x in period_map.values()):
-    st.info('Puedes seguir preparando y revisando las tareas por EVENTO. No se crearán tareas por FECHA con unidades desconocidas.')
-events={}
-for _,r in ts[ts.ACTIVADOR=='Evento'].iterrows():
-    events[r.ID_TAREA]=st.text_input(f'Evento para {r.ID_TAREA}: {r.NOMBRE_TAREA}',value=str(r.NOMBRE_TAREA),key='ev_'+r.ID_TAREA)
+def extract_id(out):
+    data=out.get('data') if isinstance(out,dict) else None
+    if isinstance(data,dict):return positive_int(data.get('id'))
+    return None
 
-st.header('3 · Elegir plan y tarea')
-found=match(st.session_state.get('v12_plans',[]),plan_name)
-if len(found)>1:st.error('Existen varios planes con el mismo nombre. Se bloquea la importación.');st.stop()
-if found:
-    plan_id=int(found[0]['id']);st.success(f'Plan ya existente: {plan_name} · ID {plan_id}')
+def required_event_name(name,task_name):
+    return (name or task_name).strip()
+
+st.header('2 · Conectar y preparar')
+if not ready:
+    st.error('Configura FRACTTAL_CLIENT_ID y FRACTTAL_CLIENT_SECRET en los secretos de Streamlit.');st.stop()
+if st.button('🔄 Actualizar datos de Fracttal (solo lectura)',type='primary'):
+    try:
+        access=token()
+        allplans=plans(access)
+        alltasktypes=paginated(access,'/tasks/')
+        candidates=sorted({(str(x.get('tasks_types_main_description','')).strip(),int(x['id_task_type_main']))
+            for x in alltasktypes if str(x.get('id_task_type_main','')).isdigit() and x.get('tasks_types_main_description')},key=lambda x:(norm(x[0]),x[1]))
+        refs,freq=discover_freq(access)
+        st.session_state.final_data={'plans':allplans,'types':candidates,'freq':freq,'refs':refs}
+        st.success(f'{len(allplans)} planes, {len(candidates)} tipos y {len(freq)} frecuencias identificadas por nombre.')
+    except Exception as ex:
+        st.error(fmt_error(ex))
+        st.session_state.pop('final_data',None)
+base=st.session_state.get('final_data')
+if not base:
+    st.info('Pulsa «Actualizar datos de Fracttal» para comenzar.');st.stop()
+
+matched=match(base['plans'],plan_name)
+if len(matched)>1:
+    st.error('Hay varios planes con el mismo nombre. Para evitar errores se bloquea la importación.');st.stop()
+if matched:
+    plan_id=positive_int(matched[0].get('id'))
+    st.success(f'Plan existente: {plan_name} · ID {plan_id}')
 else:
-    st.warning('El plan no existe en los resultados consultados. Puedes crearlo antes de importar las tareas.')
-    st.code(plan_name,language=None)
-    ok=st.checkbox('Confirmo crear este plan REAL sin vincular activos.')
-    phrase=st.text_input('Escribe CREAR PLAN para autorizar',key='create_plan_phrase')
-    if st.button('Crear plan en Fracttal',disabled=not(ok and phrase=='CREAR PLAN')):
+    st.warning('El plan no existe en los resultados actuales.')
+    st.code(plan_name)
+    st.checkbox('Confirmo la creación del plan real, sin activos',key='approve_plan')
+    st.text_input('Para crear el plan escribe CREAR PLAN',key='approve_plan_text')
+    if st.button('Crear plan',disabled=not(st.session_state.get('approve_plan') and st.session_state.get('approve_plan_text')=='CREAR PLAN')):
         try:
-            t=token();fresh=match(plans(t),plan_name)
-            if fresh:st.warning('Plan ya existe. Actualiza consulta.');st.stop()
-            code,response=api('POST','/groups_tasks/',t,{'description':plan_name})
-            st.success(f'Petición enviada (HTTP {code}). Comprueba el nuevo plan y vuelve a consultar. No repitas la creación.')
-            st.session_state.v12_plans=plans(t)
-        except Exception as exc:st.error(fmt_error(exc))
+            access=token()
+            if match(plans(access),plan_name):
+                st.warning('El plan ya existe. Actualiza los datos.')
+            else:
+                _,out=api('POST','/groups_tasks/',access,{'description':plan_name})
+                st.success('Solicitud de creación enviada. Actualiza los datos y verifica el plan.')
+        except Exception as ex:st.error(fmt_error(ex))
+    st.stop()
+if not plan_id:st.error('Plan sin identificador válido');st.stop()
+
+st.subheader('Tipos de tarea: asignación automática')
+st.caption('Tipos existentes en Europlátano: Correctivo, Mejora, Predictivo y Preventivo, cada uno Interno/Externo. El Excel indica la clase. Se selecciona automáticamente la variante Interno por defecto; no tienes que elegir una por tarea.')
+KNOWN_LABELS=['Correctivo externo','Correctivo interno','Mejora externa','Mejora interna',
+              'Predictivo externo','Predictivo interno','Preventivo externo','Preventivo interno']
+
+# Un identificador de tipo se acepta automáticamente solo si el ID y el nombre
+# proceden del mismo registro real devuelto por la API del tenant.
+def auto_type_choice(src, real_types):
+    q=norm(src)
+    exact=[(name,id_) for name,id_ in real_types if norm(name)==q]
+    if len(exact)==1:return exact[0], 'Coincidencia exacta'
+    variant='externo' if 'extern' in q else 'interno'
+    family=next((x for x in ['preventivo','correctivo','predictivo','mejora'] if x in q),None)
+    possible=[(name,id_) for name,id_ in real_types
+              if family and family in norm(name) and variant in norm(name)]
+    if len(possible)==1:return possible[0], 'Correspondencia automática'
+    return None, 'No resuelto o ambiguo'
+
+chosen_types={}
+type_overrides={}
+for typ in sorted(set(ts.TIPO_INICIAL)):
+    picked,state=auto_type_choice(typ,base['types'])
+    if picked:chosen_types[typ]=picked
+    type_overrides[typ]=state
+with st.expander('Ver tipos disponibles en Europlátano y cambiar correspondencias (opcional)'):
+    st.write('Tipos esperados: '+', '.join(KNOWN_LABELS))
+    choices=base['types']
+    for typ in sorted(set(ts.TIPO_INICIAL)):
+        picked=chosen_types.get(typ)
+        foundidx=next((i+1 for i,x in enumerate(choices) if picked and x==picked),0)
+        chosen=st.selectbox(f'{typ} en Excel', [None]+choices,index=foundidx,
+            format_func=lambda v:'Sin asignar' if v is None else f'{v[0]} (ID {v[1]})',key='mapping_'+typ)
+        if chosen:chosen_types[typ]=chosen
+        else:chosen_types.pop(typ,None)
+summary_types=pd.DataFrame([{'Tipo en Excel':typ,
+                             'Tipo en Fracttal':chosen_types.get(typ,('SIN RESOLVER',))[0],
+                             'Origen':type_overrides[typ]}
+                             for typ in sorted(set(ts.TIPO_INICIAL))])
+st.dataframe(summary_types,hide_index=True,use_container_width=True)
+if len(chosen_types)!=len(set(ts.TIPO_INICIAL)):
+    st.error('Faltan tipos principales en los registros recuperados de Fracttal. No se inventarán IDs. Consulta el catálogo o elige la correspondencia excepcional en el apartado anterior.')
     st.stop()
 
-labels=[f'{r.ID_TAREA} · {r.NOMBRE_TAREA}' for _,r in ts.iterrows()]
-choice=st.selectbox('Selecciona UNA tarea que quieras importar',range(len(labels)),format_func=lambda i:labels[i])
-r=ts.iloc[choice]
-subrows=ss[ss.ID_TAREA==r.ID_TAREA].copy()
-subrows['_order']=subrows.ORDEN.astype(int)
-subrows=subrows.sort_values('_order')
+st.header('3 · Activadores: configuración tomada del Excel')
+st.caption('La frecuencia es el selector propio del activador Fecha (días, semanas, meses o años). No es un catálogo de unidades de lectura, ni se elige para cada tarea.')
 
-def yes(value):return str(value).strip().casefold() in ('sí','si')
+# La API pide un ID numérico para la opción de un desplegable fijo de Fracttal.
+# Recuperamos las equivalencias cuando los datos de la API las incluyen.
+# El ejemplo público de la API corresponde a 1 mes y id_period_date=2,
+# pero no lo usamos como prueba universal para todas las unidades.
+needs=sorted({unit_name(x) for x in ts.loc[ts.ACTIVADOR=='Fecha','UNIDAD_INTERVALO'] if unit_name(x)})
+settings={}
+for _,r in ts.iterrows():
+    tid=str(r.ID_TAREA)
+    if r.ACTIVADOR=='Fecha':
+        un=unit_name(r.UNIDAD_INTERVALO)
+        settings[tid]={'kind':'Fecha','unit':un,'amount':int(r.INTERVALO),
+                       'replay':'Siempre','repetitions':None,'fixed':None}
+    else:
+        settings[tid]={'kind':'Evento','event':None}
 
-def mk_sub(row):
-    result={'description':str(row.DESCRIPCION).strip(), 'id_task_form_item_type':TYPES[row.TIPO_SUBTAREA], 'is_required':yes(row.OBLIGATORIA),'attachments_required':yes(row.ADJUNTO_OBLIGATORIO),'task_form_item_group_description':str(row.GRUPO_PARTE).strip()}
-    if row.TIPO_SUBTAREA=='Lista':result['dropdown_options']=[{'description':x.strip()} for x in str(row.get('OPCIONES_RESPUESTA','')).split('|') if x.strip()]
+st.subheader('Tareas por fecha')
+date_rows=[]
+for _,r in ts[ts.ACTIVADOR=='Fecha'].iterrows():
+    x=settings[str(r.ID_TAREA)]
+    date_rows.append({'Tarea':str(r.ID_TAREA),'Descripción':str(r.NOMBRE_TAREA),
+                      'Hacer cada':x['amount'],'Frecuencia':x['unit'],
+                      'Repetir':'Siempre','Programación fija':'Pendiente de API'})
+if date_rows:st.dataframe(pd.DataFrame(date_rows),hide_index=True,use_container_width=True)
+if any(x['unit'] is None for x in settings.values() if x['kind']=='Fecha'):
+    st.error('El Excel incluye una frecuencia por fecha no reconocida.');st.stop()
+
+with st.expander('Cambiar periodicidad o repetición (solo si necesitas modificar el Excel)'):
+    for _,r in ts[ts.ACTIVADOR=='Fecha'].iterrows():
+        tid=str(r.ID_TAREA); x=settings[tid]
+        st.write(f'{tid}: {r.NOMBRE_TAREA}')
+        c1,c2,c3=st.columns(3)
+        x['amount']=int(c1.number_input('Hacer cada',1,999,x['amount'],key='amount_'+tid))
+        x['unit']=c2.selectbox('Frecuencia',['Día','Semana','Mes','Año'],
+            index=['Día','Semana','Mes','Año'].index(x['unit']),key='unit_'+tid)
+        x['replay']=c3.selectbox('Repetir',['Siempre','Por un número de veces'],key='replay_'+tid)
+        x['repetitions']=(int(st.number_input('Número de veces',1,99999,1,key='count_'+tid))
+                           if x['replay']!='Siempre' else None)
+        st.caption('Programación fija: la API documentada no incluye todavía un campo confirmado; deberá revisarse en Fracttal. No se inventará su valor.')
+
+# No imponemos una lista cerrada de ID numéricos: una referencia solo vale
+# cuando el registro de la API aporta nombre y código conjuntamente.
+frequency_map=dict(base['freq'])
+if frequency_map:
+    st.caption('Frecuencias detectadas automáticamente a partir de datos recuperados de Fracttal: '+
+               ', '.join(sorted(frequency_map)))
+missing_freq=[x for x in needs if x not in frequency_map]
+if missing_freq:
+    st.warning('La API no ha facilitado todavía el código de '+', '.join(missing_freq)+
+               '. Las tareas por evento pueden importarse. Las tareas por fecha quedarán pendientes: no hay que escribir códigos manuales ni adivinarlos.')
+
+suggestions={
+'T04':'AVERÍA O DESAJUSTE DEL CABEZAL DE FLEJADO',
+'T05':'AVERÍA DE CILINDROS NEUMÁTICOS',
+'T06':'FALLO DEL SISTEMA DE CANTONERAS',
+'T07':'FALLO DE ALIMENTACIÓN DE FLEJE',
+'T08':'AVERÍA O DESAJUSTE DE SENSORES',
+'T09':'INCIDENCIA MECÁNICA',
+'T10':'INCIDENCIA ELÉCTRICA O DE AUTOMATIZACIÓN'}
+for _,r in ts[ts.ACTIVADOR=='Evento'].iterrows():
+    tid=str(r.ID_TAREA)
+    settings[tid]['event']=suggestions.get(tid,str(r.NOMBRE_TAREA))
+with st.expander('Editar eventos propuestos (opcional)'):
+    for _,r in ts[ts.ACTIVADOR=='Evento'].iterrows():
+        tid=str(r.ID_TAREA)
+        settings[tid]['event']=st.text_input(str(r.NOMBRE_TAREA),
+            value=settings[tid]['event'],key='evt_'+tid).strip()
+
+with st.expander('📋 Listado de eventos a preparar en Fracttal'):
+    event_names=sorted({settings[str(rr.ID_TAREA)]['event'] for _,rr in ts.iterrows() if rr.ACTIVADOR=='Evento' and settings[str(rr.ID_TAREA)]['event']})
+    st.write('Si alguno no existe, créalo desde el catálogo de Fracttal antes de importar esa tarea.')
+    st.dataframe(pd.DataFrame({'Evento propuesto':event_names}),hide_index=True,use_container_width=True)
+    st.download_button('Descargar listado de eventos',data='\n'.join(event_names),file_name='eventos_fracttal_pendientes.txt',mime='text/plain')
+
+st.header('4 · Seleccionar y comprobar')
+ids=list(ts.ID_TAREA)
+selected=st.multiselect('Tareas a importar (las existentes se reutilizan)',options=ids,
+    default=ids,format_func=lambda i:f'{i} · {ts.loc[ts.ID_TAREA==i,"NOMBRE_TAREA"].iloc[0]}')
+if not selected:st.info('Selecciona al menos una tarea.');st.stop()
+with st.expander('Ver los datos que se importarán',expanded=False):
+    st.dataframe(ts[ts.ID_TAREA.isin(selected)],hide_index=True,use_container_width=True)
+    st.dataframe(ss[ss.ID_TAREA.isin(selected)],hide_index=True,use_container_width=True)
+
+# El usuario puede continuar una sesión con una tarea existente que ya tenga sus subtareas.
+# El proceso detiene el lote ante incidencias para no generar estados ambiguos.
+if st.button('🔎 Comprobar tareas existentes y estado de subtareas (solo lectura)'):
+    try:
+        access=token();existing_tasks=tasks(access,plan_id)
+        diagnostics={}
+        for tid in selected:
+            rr=ts[ts.ID_TAREA==tid].iloc[0]
+            hits=match(existing_tasks,str(rr.NOMBRE_TAREA))
+            if len(hits)>1:raise RuntimeError(f'{tid}: hay tareas duplicadas en el plan.')
+            subcount=None
+            if hits:subcount=len(subtasks(access,int(hits[0]['id'])))
+            diagnostics[tid]={'name':str(rr.NOMBRE_TAREA),'id':int(hits[0]['id']) if hits else None,
+                              'subcount':subcount,'wanted':len(ss[ss.ID_TAREA==tid])}
+        st.session_state.final_preflight={'file':file_hash,'plan':plan_id,'selected':tuple(selected),
+            'types':chosen_types.copy(),'settings':json.dumps({i:settings[i] for i in selected},ensure_ascii=False,sort_keys=True),
+            'diag':diagnostics}
+        st.success('Consulta completada. Revisa el resumen.')
+    except Exception as ex:
+        st.session_state.pop('final_preflight',None);st.error(fmt_error(ex))
+check=st.session_state.get('final_preflight')
+valid=bool(check and check['file']==file_hash and check['plan']==plan_id and check['selected']==tuple(selected)
+    and check['types']==chosen_types and check['settings']==json.dumps({i:settings[i] for i in selected},ensure_ascii=False,sort_keys=True))
+if valid:
+    table=[]
+    for tid,v in check['diag'].items():
+        status='Pendiente' if v['id'] is None else ('Completa' if v['subcount']==v['wanted'] else f'Existente · {v["subcount"]}/{v["wanted"]} subtareas')
+        table.append({'Tarea':tid,'Nombre':v['name'],'Estado':status})
+    st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True)
+else:st.info('Ejecuta la comprobación y no cambies selecciones antes de importar.')
+
+st.header('5 · Importar (sin activos)')
+st.warning('Fracttal exige que los eventos existan en su catálogo. Si falta alguno, la tarea se detendrá con un error sin modificar los demás registros.')
+ack_events=st.checkbox('He comprobado en Fracttal los eventos de las tareas seleccionadas.')
+ack_final=st.checkbox('Autorizo crear únicamente las tareas/subtareas pendientes, sin borrar, editar ni vincular activos.')
+confirm_text=st.text_input('Escribe IMPORTAR PLAN para iniciar el lote')
+
+unresolved=[i for i in selected if settings[i]['kind']=='Fecha' and settings[i]['unit'] not in frequency_map]
+fixed_pending=[]
+if unresolved:st.error('No se pueden importar por fecha estas tareas sin conocer la unidad exacta: '+', '.join(unresolved))
+if fixed_pending:st.warning('Programación fija pendiente de comprobación en la API para: '+', '.join(fixed_pending))
+
+def build_trigger(i):
+    conf=settings[i]
+    if conf['kind']=='Evento':
+        if not conf['event']:raise RuntimeError(f'{i}: falta evento')
+        return {'id_task_trigger_type':4,'event_description':conf['event']}
+    unit_id=frequency_map.get(conf['unit'])
+    if not unit_id:raise RuntimeError(f'{i}: periodicidad no verificada')
+    tr={'id_task_trigger_type':1,'value_main':conf['amount'],'id_period_date':unit_id,
+        'id_replay':1 if conf['replay']=='Siempre' else 2}
+    if conf['repetitions'] is not None:tr['value_end']=int(conf['repetitions'])
+    return tr
+
+def build_subs(tid):
+    rows=ss[ss.ID_TAREA==tid].copy()
+    rows['_ord']=rows.ORDEN.astype(int)
+    rows=rows.sort_values('_ord')
+    result=[]
+    for _,row in rows.iterrows():
+        sub={'description':str(row.DESCRIPCION).strip(),'id_task_form_item_type':TYPES[row.TIPO_SUBTAREA],
+            'is_required':norm(row.OBLIGATORIA)=='si',
+            'attachments_required':norm(row.ADJUNTO_OBLIGATORIO)=='si',
+            'task_form_item_group_description':str(row.GRUPO_PARTE).strip()}
+        if row.TIPO_SUBTAREA=='Lista':
+            sub['dropdown_options']=[{'description':v.strip()} for v in str(row.get('OPCIONES_RESPUESTA','')).split('|') if v.strip()]
+        result.append(sub)
     return result
 
-# Mimic the V11 successfully tested payload exactly: subtasks is present but empty.
-# The complete checklist is added only in the second POST /tasks_subtasks/.
-payload={'description':str(r.NOMBRE_TAREA).strip(),'id_task_type_main':selected_types[r.TIPO_INICIAL][1],'id_group_task':plan_id,'triggers':[],'subtasks':[]}
-if r.ACTIVADOR=='Fecha':
-    val=period_map.get(r.UNIDAD_INTERVALO,0)
-    if val:payload['triggers']=[{'id_task_trigger_type':1,'value_main':int(r.INTERVALO),'id_period_date':val,'id_replay':1}]
-else:
-    payload['triggers']=[{'id_task_trigger_type':4,'event_description':events[r.ID_TAREA].strip()}]
-# Deliberately do not send duration here: V11 accepted the minimal schema without it.
-# Task duration can be configured later once independently verified.
-subs=[mk_sub(row) for _,row in subrows.iterrows()]
-st.write(f'**{len(subs)} subtareas**, {r.ACTIVADOR}, **sin activos**. Grupo/Parte y adjuntos se enviarán con cada subtarea.')
-st.caption('V16: la solicitud mínima para EVENTO reproduce exactamente los nombres de campos de la V11. Si vuelve a dar HTTP 400, el error mostrará una descripción filtrada del servidor. No confundimos similitud de formato con validez de un evento de catálogo.')
-with st.expander('Vista previa de tarea (POST /tasks_plan/)',expanded=False):st.json(payload)
-with st.expander('Vista previa de subtareas (POST /tasks_subtasks/)',expanded=False):st.json({'id_task':'<se obtendrá al crear tarea>','is_cyclical':False,'subtasks':subs})
-
-st.subheader('🔬 Diagnóstico comparativo sin escribir')
-st.info('V11 y V15 utilizan el MISMO esquema mínimo de creación por evento. La diferencia real puede estar en el VALOR del evento: Fracttal exige resolverlo en su catálogo. La API podría devolver HTTP 400 si ese nombre no existe. No se enviará ninguna petición de escritura durante este diagnóstico.')
-expected={'description','id_task_type_main','id_group_task','triggers','subtasks'}
-extra=set(payload)-expected
-st.write('Campos mínimos esperados (según V11):', ', '.join(sorted(expected)))
-st.write('Campos adicionales en el POST seleccionado:', ', '.join(sorted(extra)) or 'Ninguno')
-if r.ACTIVADOR=='Evento':
-    st.write('Evento que debe existir en el catálogo o resolverse por la API:', events[r.ID_TAREA].strip())
-    st.warning('Si el error 400 menciona evento inexistente: crea o selecciona ese evento en el catálogo de Fracttal ANTES de volver a probar. No sustituiremos silenciosamente el activador por uno genérico.')
-
-# Huella de los datos que se han inspeccionado para invalidar comprobaciones previas
-# cuando cambia el tipo, el evento o el activador.
-payload_digest=hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()
-
-
-st.subheader('Comprobación de duplicados (solo lectura)')
-if st.button('🔎 Consultar tareas y subtareas del plan'):
+allowed=bool(valid and not unresolved and ack_events and ack_final and confirm_text=='IMPORTAR PLAN')
+run_key='completed_final_'+str(plan_id)+'_'+file_hash+'_'+hashlib.sha256(repr(tuple(selected)).encode()).hexdigest()[:12]
+if st.session_state.get(run_key):st.info('Se ejecutó este lote durante la sesión. Actualiza y vuelve a comprobar el estado antes de otra importación.')
+if st.button('🚀 Importar tareas seleccionadas',type='primary',disabled=not allowed or bool(st.session_state.get(run_key))):
+    st.session_state[run_key]=True
+    logs=[]
+    progress=st.progress(0)
     try:
-        t=token();existing=match(tasks(t,plan_id),payload['description'])
-        st.session_state.v12_check=(file_hash,plan_id,r.ID_TAREA,payload_digest,existing)
-        if len(existing)>1:st.error('Más de una tarea con el mismo nombre. Se bloquea la importación.')
-        elif len(existing)==1:
-            st.info(f'La tarea YA existe (ID {existing[0]["id"]}). No se duplicará. Puedes verificar si le faltan subtareas.')
-        else:st.success('No existe una tarea con este nombre en el plan. Lista para prueba de creación.')
-    except Exception as exc:
-        st.session_state.pop('v12_check',None);st.error(fmt_error(exc))
-
-check=st.session_state.get('v12_check')
-check_valid=bool(check and check[:4]==(file_hash,plan_id,r.ID_TAREA,payload_digest))
-existing=check[4] if check_valid else None
-
-st.subheader('4 · Ejecutar un paso controlado')
-st.caption('El proceso se divide en dos operaciones: 1) crear tarea con activador y 2) añadir subtareas con su Grupo/Parte y adjunto obligatorio. Así utilizamos el endpoint que admite nombres de Grupo/Parte. Si algo falla, NO repetimos automáticamente.')
-confirm=st.checkbox('He comprobado los datos y entiendo que se modificará Fracttal.',key='v12_confirm')
-phrase=st.text_input('Escribe IMPORTAR TAREA para autorizar',key='v12_phrase')
-allowed=bool(confirm and phrase=='IMPORTAR TAREA' and check_valid)
-
-if existing is not None and len(existing)>1:st.error('Duplicidad de tareas, bloqueado.');st.stop()
-attempt_key=f'attempt_v16_{plan_id}_{payload_digest}'
-if st.session_state.get(attempt_key):
-    st.warning('Ya se ha intentado este POST durante la sesión. No se permite pulsarlo dos veces. Comprueba el plan en Fracttal. Tras comprobar el resultado, reinicia sesión para un nuevo intento. Si continúa el HTTP 400, NO repitas: facilita el mensaje filtrado.')
-if existing is not None and len(existing)==0:
-    if st.button('1️⃣ Crear solo ESTA tarea (sin subtareas)',disabled=not (allowed and payload['triggers']) and not st.session_state.get(attempt_key)):
-        st.session_state[attempt_key]=True
-        try:
-            t=token()
-            current=match(tasks(t,plan_id),payload['description'])
-            if current:st.warning('Tarea ya existente, no se creó otra. Vuelve a consultar.')
-            else:
-                code,out=api('POST','/tasks_plan/',t,payload)
-                data=out.get('data') if isinstance(out,dict) else None
-                ident=data.get('id') if isinstance(data,dict) else None
-                st.session_state.pop('v12_check',None)
-                if ident:st.success(f'Tarea creada (ID {ident}). Ahora pulsa Consultar tareas y subtareas para habilitar el paso 2.')
-                else:st.warning(f'HTTP {code} sin ID verificable. Comprueba Fracttal y vuelve a consultar; NO repitas la escritura.')
-        except Exception as exc:
-            st.session_state.pop('v12_check',None)
-            safe_msg=fmt_error(exc)
-            st.error(safe_msg)
-            st.warning('No reintentes la escritura. Comprueba Fracttal y comparte ÚNICAMENTE este mensaje filtrado, sin credenciales.')
-            if isinstance(exc,FracttalAPIError):
-                st.code(safe_msg,language=None)
-                st.download_button('Descargar diagnóstico sin secretos',data=json.dumps({'version':'16','http_status':exc.status,'endpoint':exc.path,'method':exc.method,'detalle_filtrado':exc.detail,'campos_enviados':sorted(payload.keys()),'tipo_activador':r.ACTIVADOR,'plan_id':plan_id},ensure_ascii=False,indent=2),file_name='diagnostico_fracttal_v16.json',mime='application/json')
-
-if existing is not None and len(existing)==1:
-    tid=int(existing[0]['id'])
-    if st.button('🔎 Verificar subtareas existentes de ESTA tarea'):
-        try:
-            existing_subs=subtasks(token(),tid)
-            st.session_state.v12_subcheck=(file_hash,plan_id,r.ID_TAREA,payload_digest,tid,existing_subs)
-            st.success(f'Subtareas existentes: {len(existing_subs)}')
-        except Exception as exc:
-            st.session_state.pop('v12_subcheck',None);st.error(fmt_error(exc))
-    subcheck=st.session_state.get('v12_subcheck')
-    if subcheck and subcheck[:5]==(file_hash,plan_id,r.ID_TAREA,payload_digest,tid):
-        old=subcheck[5]
-        if old:
-            st.warning(f'Hay {len(old)} subtarea(s) en la tarea. No se permiten cargas automáticas adicionales para evitar duplicaciones o mezclar órdenes. Comprueba manualmente.')
-        else:
-            st.success('La tarea NO tiene subtareas. Se puede crear el bloque completo una sola vez.')
-            if st.button('2️⃣ Crear todas las subtareas de ESTA tarea',disabled=not(allowed and len(subs)>0)):
-                try:
-                    t=token()
-                    fresh=match(tasks(t,plan_id),payload['description'])
-                    if len(fresh)!=1 or int(fresh[0]['id'])!=tid:raise RuntimeError('La tarea cambió. Escritura bloqueada.')
-                    if subtasks(t,tid):raise RuntimeError('Ya hay subtareas. Escritura bloqueada.')
-                    code,out=api('POST','/tasks_subtasks/',t,{'id_task':tid,'is_cyclical':False,'subtasks':subs})
-                    st.session_state.pop('v12_subcheck',None)
-                    st.session_state.pop('v12_check',None)
-                    st.success(f'Petición de subtareas enviada (HTTP {code}). Comprueba cada Grupo/Parte, lista y adjunto obligatorio en Fracttal.')
-                    st.info('No repetir. Vuelve a consultar tareas y subtareas para confirmar.')
-                except Exception as exc:
-                    st.session_state.pop('v12_subcheck',None)
-                    st.error(fmt_error(exc));st.warning('Comprueba Fracttal antes de repetir; puede haber una escritura parcial.')
-
-st.divider()
-st.caption('V16 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
+        access=token()
+        for n,tid in enumerate(selected,1):
+            rr=ts[ts.ID_TAREA==tid].iloc[0]
+            name=str(rr.NOMBRE_TAREA).strip()
+            expected=len(ss[ss.ID_TAREA==tid])
+            current=match(tasks(access,plan_id),name)
+            if len(current)>1:raise RuntimeError(f'{tid}: tarea duplicada; detenido.')
+            if not current:
+                tr=build_trigger(tid)
+                duration=max(60,60*int(rr.ESTIMACION_MIN or 10))
+                payload={'description':name,'id_task_type_main':int(chosen_types[rr.TIPO_INICIAL][1]),
+                         'id_group_task':int(plan_id),'id_priorities':3,'duration':duration,
+                         'stop_assets_sec':0,'triggers':[tr],'subtasks':[],'resources':[]}
+                _,response=api('POST','/tasks_plan/',access,payload)
+                new_id=extract_id(response)
+                if not new_id:
+                    logs.append(f'{tid}: respuesta de alta sin ID confirmado. Revisa Fracttal.')
+                    raise RuntimeError('Se detuvo el lote ante una respuesta ambigua.')
+                current=match(tasks(access,plan_id),name)
+                if len(current)!=1 or int(current[0]['id'])!=new_id:
+                    raise RuntimeError(f'{tid}: alta no verificable. Revisar plan antes de repetir.')
+                logs.append(f'{tid}: tarea creada (ID {new_id}).')
+            task_id=int(current[0]['id'])
+            old=subtasks(access,task_id)
+            if old:
+                expected_descriptions=[norm(x['description']) for x in build_subs(tid)]
+                actual_descriptions=[norm(x.get('description','')) for x in old]
+                if len(old)==expected and sorted(actual_descriptions)==sorted(expected_descriptions):
+                    logs.append(f'{tid}: subtareas presentes y descripciones coincidentes; omitida.')
+                else:
+                    logs.append(f'{tid}: subtareas existentes distintas del Excel ({len(old)}/{expected}). Se detiene para no duplicar.')
+                    raise RuntimeError(f'{tid}: subtareas parciales; requiere revisión manual.')
+            elif expected:
+                payload_sub={'id_task':task_id,'is_cyclical':False,'subtasks':build_subs(tid)}
+                api('POST','/tasks_subtasks/',access,payload_sub)
+                after=subtasks(access,task_id)
+                if len(after)!=expected or sorted(norm(x.get('description','')) for x in after)!=sorted(norm(x['description']) for x in build_subs(tid)):
+                    logs.append(f'{tid}: se esperaban {expected}, Fracttal devuelve {len(after)}.')
+                    raise RuntimeError('Se detuvo el lote: número de subtareas no confirmado.')
+                logs.append(f'{tid}: creadas {expected} subtareas.')
+            progress.progress(n/len(selected))
+        st.success('Lote finalizado y comprobado. Vincula los activos manualmente en Fracttal.')
+    except Exception as ex:
+        st.error(fmt_error(ex))
+        st.warning('Importación interrumpida. Los registros anteriores pueden haberse creado: compruébalos ANTES de ejecutar otro lote.')
+    st.session_state.final_logs=logs
+if st.session_state.get('final_logs'):
+    st.subheader('Registro de la última operación')
+    for msg in st.session_state.final_logs:st.write(msg)
+    st.download_button('Descargar registro',data='\n'.join(st.session_state.final_logs),file_name='importacion_fracttal_resumen.txt',mime='text/plain')
+st.caption('Los tipos del Excel se asignan en bloque. Las periodicidades son opciones del activador Fecha, no unidades de lectura. No se vinculan activos ni se crean OT.')
