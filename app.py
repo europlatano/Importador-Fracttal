@@ -1,4 +1,4 @@
-"""Europlatano Fracttal test importer V5: manual task type mappings and test-only writes."""
+"""Europlatano Fracttal test importer V6: diagnostics for task listing and guarded test-only writes."""
 import io
 import json
 import hmac
@@ -12,10 +12,10 @@ TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
 TEST_TASK = 'PRUEBA API – INSPECCIÓN DE EJEMPLO (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V5', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V6', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 5 · Selección manual de tipos de tarea · SIN ACTIVOS')
-st.warning('Esta versión permite elegir manualmente el tipo de tarea observado en Fracttal, con su nombre exacto e ID. Solo se puede crear UNA tarea de prueba con confirmación; NO importa el Excel completo.')
+st.caption('Europlátano · Versión 6 · Diagnóstico de consultas y prueba de UNA tarea · SIN ACTIVOS')
+st.warning('Versión de diagnóstico: distingue respuestas inesperadas de la API, permite revisar el plan de prueba y controla la creación de UNA tarea. NO importa el Excel completo.')
 
 
 def setting(key):
@@ -166,25 +166,70 @@ st.header('3 · Elegir tipo de tarea y probar UNA tarea')
 st.info('Consulta tipos observados en las tareas existentes y elige el nombre e ID exactos. Esto es una lista observada, NO el catálogo completo de tipos configurados en Fracttal.')
 
 
+def response_shape(value):
+    """Safe structural metadata only: never show full API response contents."""
+    if isinstance(value, dict):
+        return {'tipo': 'objeto', 'claves': sorted(str(k) for k in value.keys())[:20],
+                'tipo_data': type(value.get('data')).__name__,
+                'tipo_total': type(value.get('total')).__name__}
+    if isinstance(value, list):
+        return {'tipo': 'lista', 'elementos': len(value)}
+    return {'tipo': type(value).__name__}
+
+
+def extract_task_rows(response):
+    """Recognize only defensible task collection structures, with no false empty lists."""
+    if isinstance(response, list):
+        return response, None
+    if not isinstance(response, dict):
+        raise ValueError('Respuesta GET /tasks/ inesperada: ' + json.dumps(response_shape(response), ensure_ascii=False))
+    if isinstance(response.get('data'), list):
+        return response['data'], response.get('total')
+    nested = response.get('data')
+    if isinstance(nested, dict):
+        for key in ('data', 'tasks', 'items', 'results'):
+            if isinstance(nested.get(key), list):
+                return nested[key], nested.get('total', response.get('total'))
+    for key in ('tasks', 'items', 'results'):
+        if isinstance(response.get(key), list):
+            return response[key], response.get('total')
+    raise ValueError('GET /tasks/ no devolvió una colección reconocible. Estructura: '
+                     + json.dumps(response_shape(response), ensure_ascii=False))
+
+
 def fetch_tasks(token, group_id=None):
-    """Paginate full listing; filter by plan on server for duplicate check."""
+    """Read tasks, do not assume successful HTTP implies a list."""
     found = []
     for offset in range(0, 30000, 100):
         params = {'start': offset, 'limit': 100}
         if group_id is not None:
             params['id_group_task'] = int(group_id)
-        _, response = call_api('GET', '/tasks/', token, params=params)
-        rows = response.get('data') if isinstance(response, dict) else None
-        if not isinstance(rows, list):
-            raise ValueError('La API no devolvió una lista de tareas.')
+        status, response = call_api('GET', '/tasks/', token, params=params)
+        try:
+            rows, raw_total = extract_task_rows(response)
+        except ValueError as exc:
+            raise ValueError(f'{exc} (HTTP {status}, offset {offset}).') from exc
+        if not all(isinstance(item, dict) for item in rows):
+            raise ValueError('GET /tasks/ contiene registros que no son objetos. Creación bloqueada.')
         found.extend(rows)
         try:
-            total = int(response.get('total')) if response.get('total') is not None else None
+            total = int(raw_total) if raw_total is not None else None
         except (TypeError, ValueError):
             total = None
         if (total is not None and len(found) >= total) or len(rows) < 100:
             return found
-    raise ValueError('No se pudo recorrer todo el catálogo de tareas. Se bloquea la creación.')
+        if rows and offset > 0 and rows == found[-200:-100]:
+            raise ValueError('La paginación de tareas repitió resultados; consulta incompleta.')
+    raise ValueError('Se excedió límite de paginación (30.000 tareas); creación bloqueada.')
+
+
+def exact_tasks_in_plan(token, plan_id):
+    """Ensure server filter has actually been respected."""
+    rows = fetch_tasks(token, group_id=plan_id)
+    mismatched = [r for r in rows if str(r.get('id_group_task', '')) != str(plan_id)]
+    if mismatched:
+        raise ValueError('GET /tasks/ devolvió tareas ajenas al plan solicitado; se bloquea la operación.')
+    return rows
 
 
 def preventive_type_ids(tasks):
@@ -243,6 +288,7 @@ with left:
             st.session_state.pop('test_plan_id', None)
         else:
             st.session_state.test_plan_id = plan_id_found
+            st.session_state.pop('preflight', None)
             st.success(f'Plan de prueba localizado. ID: {plan_id_found}')
 with right:
     if st.button('🔎 Consultar tipos utilizados en Fracttal', disabled=not ready):
@@ -276,54 +322,115 @@ if observed:
 else:
     st.info('Pulsa «Consultar tipos utilizados en Fracttal» para activar el desplegable.')
 
-st.caption('La prueba crea una sola tarea de EVENTO dentro del plan de prueba. Puede añadir un evento al catálogo. No vincula activos, no crea OT ni importa el Excel Reisopack.')
-ack_event = st.checkbox('Autorizo crear UNA tarea de prueba en el plan indicado con el tipo elegido, sin activos.', key='ack_event')
-typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task')
-can_create_task = bool(ready and st.session_state.get('test_plan_id') and selected_key and ack_event and typed_task == 'CREAR TAREA PRUEBA')
-if st.button('🧪 Crear una sola tarea de prueba', disabled=not can_create_task):
-    if st.session_state.get('task_post_attempted'):
-        st.error('Ya se intentó crear en esta sesión. Verifica Fracttal y evita repetir la operación.')
-    else:
-        st.session_state.task_post_attempted = True
+st.subheader('Diagnóstico previo, en solo lectura')
+st.caption('Este diagnóstico identifica si el GET de tareas funciona o qué estructura devuelve. No cambia Fracttal.')
+if st.button('🔍 Diagnosticar listado y duplicados del plan', disabled=not (ready and st.session_state.get('test_plan_id'))):
+    def diagnose():
+        token = get_token()
         plan_id = int(st.session_state.test_plan_id)
-        main_type_id = int(selected_key[1])
-        payload = {
-            'description': TEST_TASK,
-            'id_task_type_main': main_type_id,
-            'id_group_task': plan_id,
-            'triggers': [{'id_task_trigger_type': 4, 'event_description': TEST_EVENT}],
-            'subtasks': [
-                {'description': 'Comprobar visualmente el estado general (solo prueba API)', 'id_task_form_item_type': 4, 'is_required': True},
-                {'description': 'Observaciones de prueba (sin datos confidenciales)', 'id_task_form_item_type': 1, 'is_required': False},
-            ],
-            'resources': [],
-        }
-        def attempt_task_once():
-            token = get_token()
-            prior = [row for row in fetch_tasks(token, group_id=plan_id)
-                     if str(row.get('description', '')).strip().casefold() == TEST_TASK.casefold()]
-            if prior:
-                return 'EXISTE', None
-            status, response = call_api('POST', '/tasks_plan/', token, payload=payload)
-            if status == 201 and isinstance(response, dict):
-                task_data = response.get('data')
-                if isinstance(task_data, dict) and task_data.get('id'):
-                    return 'CREADA', task_data['id']
-            verified = [row for row in fetch_tasks(token, group_id=plan_id)
-                        if str(row.get('description', '')).strip().casefold() == TEST_TASK.casefold()]
-            if len(verified) == 1:
-                return 'VERIFICADA', verified[0].get('id')
-            raise ValueError('Resultado de creación no confirmado. Revisa Fracttal; no reintentes.')
-        result, error = safe_api_action(attempt_task_once)
-        if error:
-            st.error(error)
-            st.info('No repitas la creación sin revisar el plan en Fracttal. Comprueba también los permisos ADD sobre Plan de tareas.')
+        plans = matching_test_plans(fetch_all_plans(token))
+        if len(plans) != 1 or int(plans[0].get('id', -1)) != plan_id:
+            raise ValueError('No se verificó un único plan de prueba. No se permite crear.')
+        plan_count = plans[0].get('task_number')
+        try:
+            plan_count = int(plan_count)
+        except (TypeError, ValueError):
+            plan_count = None
+        try:
+            rows = exact_tasks_in_plan(token, plan_id)
+            return {'listing_ok': True, 'count': len(rows), 'existing': [r for r in rows if str(r.get('description','')).strip().casefold() == TEST_TASK.casefold()],
+                    'plan_count': plan_count, 'plan_id': plan_id}
+        except ValueError as exc:
+            return {'listing_ok': False, 'error': str(exc), 'plan_count': plan_count, 'plan_id': plan_id}
+    outcome, error = safe_api_action(diagnose)
+    if error:
+        st.error(error)
+        st.session_state.pop('preflight', None)
+    else:
+        st.session_state.preflight = outcome
+
+preflight = st.session_state.get('preflight')
+if preflight and preflight.get('plan_id') == st.session_state.get('test_plan_id'):
+    if preflight['listing_ok']:
+        st.success(f'GET /tasks/ correcto. Tareas en este plan: {preflight["count"]}.')
+        if preflight['existing']:
+            st.error('La tarea de prueba YA EXISTE: no se permite repetir.')
+    else:
+        st.warning('No se pudo interpretar el listado de tareas. ' + preflight['error'])
+        st.info(f'En la ficha del plan, Fracttal informa de {preflight["plan_count"] if preflight["plan_count"] is not None else "un número desconocido de"} tarea(s).')
+        if preflight['plan_count'] == 0:
+            st.warning('La lista de tareas falló, pero el plan comunica 0 tareas. Se permite una prueba EXCEPCIONAL solo si lo confirmas en la interfaz de Fracttal.')
         else:
-            state, created_id = result
-            if state == 'EXISTE':
-                st.warning('La tarea ya existe en el plan de prueba. No se duplicó.')
-            else:
-                st.success(f'Tarea {state.lower()}. ID: {created_id}. Verifica en Fracttal su tipo, activador y sus dos subtareas.')
+            st.error('No se permite crear sin un listado fiable ni confirmación de 0 tareas.')
+else:
+    st.info('Primero pulsa «Diagnosticar listado y duplicados del plan».')
+
+st.caption('La prueba crea UNA tarea de EVENTO con DOS subtareas en el plan de prueba. Puede añadir un evento al catálogo. No vincula activos ni crea OT.')
+manual_override = bool(preflight and not preflight.get('listing_ok') and preflight.get('plan_count') == 0)
+if manual_override:
+    verified_empty = st.checkbox('HE COMPROBADO en Fracttal que el plan de prueba tiene 0 tareas.', key='verified_empty')
+else:
+    verified_empty = False
+ack_event = st.checkbox('Autorizo crear UNA tarea real de prueba (con dos subtareas), sin activos.', key='ack_event_v6')
+typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task_v6')
+preflight_good = bool(preflight and (preflight.get('listing_ok') and not preflight.get('existing') or manual_override and verified_empty))
+can_create_task = bool(ready and st.session_state.get('test_plan_id') and selected_key and ack_event
+                       and typed_task == 'CREAR TAREA PRUEBA' and preflight_good and not st.session_state.get('task_post_attempted'))
+if st.button('🧪 Crear UNA tarea de prueba y dos subtareas', disabled=not can_create_task):
+    st.session_state.task_post_attempted = True  # Never submit twice in one session.
+    plan_id = int(st.session_state.test_plan_id)
+    main_type_id = int(selected_key[1])
+    payload = {
+        'description': TEST_TASK,
+        'id_task_type_main': main_type_id,
+        'id_group_task': plan_id,
+        'triggers': [{'id_task_trigger_type': 4, 'event_description': TEST_EVENT}],
+        'subtasks': [
+            {'description': 'Comprobar visualmente el estado general (solo prueba API)', 'id_task_form_item_type': 4, 'is_required': True},
+            {'description': 'Observaciones de prueba (sin datos confidenciales)', 'id_task_form_item_type': 1, 'is_required': False},
+        ],
+        'resources': [],
+    }
+    def attempt_task_once():
+        token = get_token()
+        # Independent last-minute read; if it fails, use the user's explicit
+        # empty-plan override and a current reported count of 0.
+        try:
+            before = exact_tasks_in_plan(token, plan_id)
+        except ValueError as exc:
+            if not manual_override or not verified_empty:
+                raise ValueError('No es posible verificar duplicados justo antes de escribir: ' + str(exc)) from exc
+            plans = matching_test_plans(fetch_all_plans(token))
+            if len(plans) != 1 or int(plans[0].get('task_number', -1)) != 0:
+                raise ValueError('El plan ya no informa 0 tareas. Escribe bloqueada.') from exc
+            before = []
+        if any(str(row.get('description','')).strip().casefold() == TEST_TASK.casefold() for row in before):
+            return 'EXISTE', None, 0
+        status, response = call_api('POST', '/tasks_plan/', token, payload=payload)
+        data = response.get('data') if isinstance(response, dict) else None
+        returned_id = data.get('id') if isinstance(data, dict) else None
+        if status == 201 and returned_id:
+            return 'CREADA', returned_id, status
+        # An unrecognized success response is ambiguous; never auto-resend.
+        try:
+            after = exact_tasks_in_plan(token, plan_id)
+            matches = [r for r in after if str(r.get('description','')).strip().casefold() == TEST_TASK.casefold()]
+            if len(matches) == 1:
+                return 'VERIFICADA', matches[0].get('id'), status
+        except ValueError:
+            pass
+        raise ValueError(f'POST terminó con HTTP {status}, sin confirmación suficiente de ID. Revisa Fracttal; NO reintentes.')
+    result, error = safe_api_action(attempt_task_once)
+    if error:
+        st.error(error)
+        st.info('No repitas la creación sin comprobar en Fracttal las tareas del plan. Si la API respondió con error, no se muestran datos sensibles.')
+    else:
+        state, task_id, status = result
+        if state == 'EXISTE':
+            st.warning('La tarea ya existía. No se duplicó.')
+        else:
+            st.success(f'Tarea {state.lower()} (HTTP {status}); ID: {task_id}. Comprueba sus dos subtareas y el evento en Fracttal.')
+        st.session_state.pop('preflight', None)
 
 st.divider()
 st.header('4 · Validar Excel y configurar correspondencias (SIN IMPORTAR)')
