@@ -1,10 +1,11 @@
-"""Europlátano · V15 | staged Fracttal task-plan importer.
+"""Europlátano · V16 | diagnosis-first, staged Fracttal task-plan importer.
 No asset linking, deleting, OT creation or editing. Two-stage task/subtask writes.
 """
 import io
 import json
 import hmac
 import hashlib
+import re
 import requests
 import pandas as pd
 import streamlit as st
@@ -12,10 +13,10 @@ import streamlit as st
 API='https://app.fracttal.com/api'
 TOKEN_URL='https://one.fracttal.com/oauth/token'
 TYPES={'Texto':1, 'Verificación':4, 'Lista':7}
-st.set_page_config(page_title='Importador Fracttal V15', page_icon='🛠️',layout='wide')
+st.set_page_config(page_title='Importador Fracttal V16', page_icon='🛠️',layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · V15 · Excel → plan → tareas → subtareas · SIN vincular activos')
-st.warning('IMPORTACIÓN REAL Y CONTROLADA. Elige una tarea y confirma cada escritura. Los activos se vinculan MANUALMENTE en Fracttal.')
+st.caption('Europlátano · V16 · diagnóstico real API · Excel → tarea → subtareas · SIN activos')
+st.warning('IMPORTACIÓN REAL Y CONTROLADA. Primero inspecciona el diagnóstico. Nunca reintentes automáticamente una escritura; los activos se vinculan MANUALMENTE.')
 
 def secret(key):
     try:return str(st.secrets.get(key,'')).strip()
@@ -47,7 +48,46 @@ def token():
     if not t:raise RuntimeError('Token OAuth ausente')
     return t
 
-# Errors deliberately contain no upstream body, which could echo tenant fields.
+# Nunca mostramos respuestas HTTP sin filtrar: pueden incluir datos privados del tenant.
+ALLOWED_ERROR_KEYS={'message','error','errors','details','validation_errors','field','path','code','type','status','statusCode','description'}
+SENSITIVE_KEYS=('token','secret','authorization','client_id','client_secret','password','cookie','key','auth')
+SUSPECT_FIELDS=('id_task_type_main','id_group_task','id_event','event_description','id_period_date','id_replay','value_main','triggers','subtasks','description','duration','id_priorities','stop_assets_sec')
+
+def clean_error_text(value):
+    if not isinstance(value,(str,int,float,bool)):return ''
+    val=str(value)[:700]
+    for credential in (client_id,client_secret):
+        if credential:val=val.replace(credential,'[OCULTO]')
+    val=re.sub(r'(?i)bearer\s+[\w.\-]+','Bearer [OCULTO]',val)
+    val=re.sub(r'(?i)(access_token|refresh_token|client_secret|password|authorization)\s*[:=]\s*[\"\']?[^\s,}\"\']+',r'\1=[OCULTO]',val)
+    val=re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}','[correo oculto]',val)
+    return val[:400]
+
+def safe_api_error(parsed):
+    values=[]
+    def collect(obj,depth=0):
+        if depth>3 or len(values)>10:return
+        if isinstance(obj,dict):
+            for key,val in obj.items():
+                k=str(key)
+                if any(secret in k.lower() for secret in SENSITIVE_KEYS):continue
+                if k in ALLOWED_ERROR_KEYS:
+                    if isinstance(val,(str,int,float,bool)):
+                        t=clean_error_text(val)
+                        if t:values.append(f'{k}: {t}')
+                    elif isinstance(val,(dict,list)):collect(val,depth+1)
+                elif k in SUSPECT_FIELDS and isinstance(val,(str,int,float)):
+                    values.append(f'campo {k}: {clean_error_text(val)}')
+        elif isinstance(obj,list):
+            for part in obj[:8]:collect(part,depth+1)
+    collect(parsed)
+    return ' | '.join(values[:8])[:1200] or 'El servidor no facilitó un motivo de validación legible.'
+
+class FracttalAPIError(RuntimeError):
+    def __init__(self,method,path,status,detail):
+        self.method,self.path,self.status,self.detail=method,path,status,detail
+        super().__init__(f'{method} {path}: HTTP {status}. {detail}')
+
 def api(method,path,t,payload=None,params=None):
     hdr={'Authorization':f'Bearer {t}','Accept':'application/json'}
     if payload is not None:hdr['Content-Type']='application/json'
@@ -55,7 +95,7 @@ def api(method,path,t,payload=None,params=None):
     try:data=r.json()
     except ValueError:data={}
     if r.status_code>=400 or (isinstance(data,dict) and data.get('success') is False):
-        raise RuntimeError(f'{method} {path}: HTTP {r.status_code}. Revisa registros en Fracttal antes de repetir.')
+        raise FracttalAPIError(method,path,r.status_code,safe_api_error(data))
     return r.status_code,data
 
 def rows_of(resp,source):
@@ -281,15 +321,30 @@ else:
 # Task duration can be configured later once independently verified.
 subs=[mk_sub(row) for _,row in subrows.iterrows()]
 st.write(f'**{len(subs)} subtareas**, {r.ACTIVADOR}, **sin activos**. Grupo/Parte y adjuntos se enviarán con cada subtarea.')
-st.caption('V15: POST inicial replica la estructura V11 validada (subtasks: [] y sin duration); las subtareas se crean en el segundo paso.')
+st.caption('V16: la solicitud mínima para EVENTO reproduce exactamente los nombres de campos de la V11. Si vuelve a dar HTTP 400, el error mostrará una descripción filtrada del servidor. No confundimos similitud de formato con validez de un evento de catálogo.')
 with st.expander('Vista previa de tarea (POST /tasks_plan/)',expanded=False):st.json(payload)
 with st.expander('Vista previa de subtareas (POST /tasks_subtasks/)',expanded=False):st.json({'id_task':'<se obtendrá al crear tarea>','is_cyclical':False,'subtasks':subs})
+
+st.subheader('🔬 Diagnóstico comparativo sin escribir')
+st.info('V11 y V15 utilizan el MISMO esquema mínimo de creación por evento. La diferencia real puede estar en el VALOR del evento: Fracttal exige resolverlo en su catálogo. La API podría devolver HTTP 400 si ese nombre no existe. No se enviará ninguna petición de escritura durante este diagnóstico.')
+expected={'description','id_task_type_main','id_group_task','triggers','subtasks'}
+extra=set(payload)-expected
+st.write('Campos mínimos esperados (según V11):', ', '.join(sorted(expected)))
+st.write('Campos adicionales en el POST seleccionado:', ', '.join(sorted(extra)) or 'Ninguno')
+if r.ACTIVADOR=='Evento':
+    st.write('Evento que debe existir en el catálogo o resolverse por la API:', events[r.ID_TAREA].strip())
+    st.warning('Si el error 400 menciona evento inexistente: crea o selecciona ese evento en el catálogo de Fracttal ANTES de volver a probar. No sustituiremos silenciosamente el activador por uno genérico.')
+
+# Huella de los datos que se han inspeccionado para invalidar comprobaciones previas
+# cuando cambia el tipo, el evento o el activador.
+payload_digest=hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()
+
 
 st.subheader('Comprobación de duplicados (solo lectura)')
 if st.button('🔎 Consultar tareas y subtareas del plan'):
     try:
         t=token();existing=match(tasks(t,plan_id),payload['description'])
-        st.session_state.v12_check=(file_hash,plan_id,r.ID_TAREA,existing)
+        st.session_state.v12_check=(file_hash,plan_id,r.ID_TAREA,payload_digest,existing)
         if len(existing)>1:st.error('Más de una tarea con el mismo nombre. Se bloquea la importación.')
         elif len(existing)==1:
             st.info(f'La tarea YA existe (ID {existing[0]["id"]}). No se duplicará. Puedes verificar si le faltan subtareas.')
@@ -298,8 +353,8 @@ if st.button('🔎 Consultar tareas y subtareas del plan'):
         st.session_state.pop('v12_check',None);st.error(fmt_error(exc))
 
 check=st.session_state.get('v12_check')
-check_valid=bool(check and check[:3]==(file_hash,plan_id,r.ID_TAREA))
-existing=check[3] if check_valid else None
+check_valid=bool(check and check[:4]==(file_hash,plan_id,r.ID_TAREA,payload_digest))
+existing=check[4] if check_valid else None
 
 st.subheader('4 · Ejecutar un paso controlado')
 st.caption('El proceso se divide en dos operaciones: 1) crear tarea con activador y 2) añadir subtareas con su Grupo/Parte y adjunto obligatorio. Así utilizamos el endpoint que admite nombres de Grupo/Parte. Si algo falla, NO repetimos automáticamente.')
@@ -308,8 +363,12 @@ phrase=st.text_input('Escribe IMPORTAR TAREA para autorizar',key='v12_phrase')
 allowed=bool(confirm and phrase=='IMPORTAR TAREA' and check_valid)
 
 if existing is not None and len(existing)>1:st.error('Duplicidad de tareas, bloqueado.');st.stop()
+attempt_key=f'attempt_v16_{plan_id}_{payload_digest}'
+if st.session_state.get(attempt_key):
+    st.warning('Ya se ha intentado este POST durante la sesión. No se permite pulsarlo dos veces. Comprueba el plan en Fracttal. Tras comprobar el resultado, reinicia sesión para un nuevo intento. Si continúa el HTTP 400, NO repitas: facilita el mensaje filtrado.')
 if existing is not None and len(existing)==0:
-    if st.button('1️⃣ Crear solo ESTA tarea (sin subtareas)',disabled=not (allowed and payload['triggers'])):
+    if st.button('1️⃣ Crear solo ESTA tarea (sin subtareas)',disabled=not (allowed and payload['triggers']) and not st.session_state.get(attempt_key)):
+        st.session_state[attempt_key]=True
         try:
             t=token()
             current=match(tasks(t,plan_id),payload['description'])
@@ -322,21 +381,26 @@ if existing is not None and len(existing)==0:
                 if ident:st.success(f'Tarea creada (ID {ident}). Ahora pulsa Consultar tareas y subtareas para habilitar el paso 2.')
                 else:st.warning(f'HTTP {code} sin ID verificable. Comprueba Fracttal y vuelve a consultar; NO repitas la escritura.')
         except Exception as exc:
-            st.session_state.pop('v12_check',None);st.error(fmt_error(exc))
-            st.warning('Verifica si la tarea existe en Fracttal antes de cualquier nuevo intento.')
+            st.session_state.pop('v12_check',None)
+            safe_msg=fmt_error(exc)
+            st.error(safe_msg)
+            st.warning('No reintentes la escritura. Comprueba Fracttal y comparte ÚNICAMENTE este mensaje filtrado, sin credenciales.')
+            if isinstance(exc,FracttalAPIError):
+                st.code(safe_msg,language=None)
+                st.download_button('Descargar diagnóstico sin secretos',data=json.dumps({'version':'16','http_status':exc.status,'endpoint':exc.path,'method':exc.method,'detalle_filtrado':exc.detail,'campos_enviados':sorted(payload.keys()),'tipo_activador':r.ACTIVADOR,'plan_id':plan_id},ensure_ascii=False,indent=2),file_name='diagnostico_fracttal_v16.json',mime='application/json')
 
 if existing is not None and len(existing)==1:
     tid=int(existing[0]['id'])
     if st.button('🔎 Verificar subtareas existentes de ESTA tarea'):
         try:
             existing_subs=subtasks(token(),tid)
-            st.session_state.v12_subcheck=(file_hash,plan_id,r.ID_TAREA,tid,existing_subs)
+            st.session_state.v12_subcheck=(file_hash,plan_id,r.ID_TAREA,payload_digest,tid,existing_subs)
             st.success(f'Subtareas existentes: {len(existing_subs)}')
         except Exception as exc:
             st.session_state.pop('v12_subcheck',None);st.error(fmt_error(exc))
     subcheck=st.session_state.get('v12_subcheck')
-    if subcheck and subcheck[:4]==(file_hash,plan_id,r.ID_TAREA,tid):
-        old=subcheck[4]
+    if subcheck and subcheck[:5]==(file_hash,plan_id,r.ID_TAREA,payload_digest,tid):
+        old=subcheck[5]
         if old:
             st.warning(f'Hay {len(old)} subtarea(s) en la tarea. No se permiten cargas automáticas adicionales para evitar duplicaciones o mezclar órdenes. Comprueba manualmente.')
         else:
@@ -357,4 +421,4 @@ if existing is not None and len(existing)==1:
                     st.error(fmt_error(exc));st.warning('Comprueba Fracttal antes de repetir; puede haber una escritura parcial.')
 
 st.divider()
-st.caption('V15 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
+st.caption('V16 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
