@@ -1,5 +1,6 @@
-"""Europlatano Fracttal test importer V3: deliberate, auditable test writes only."""
+"""Europlatano Fracttal test importer V5: manual task type mappings and test-only writes."""
 import io
+import json
 import hmac
 import requests
 import pandas as pd
@@ -11,10 +12,10 @@ TEST_PLAN = 'PRUEBA API – IMPORTADOR EUROPLÁTANO'
 TEST_TASK = 'PRUEBA API – INSPECCIÓN DE EJEMPLO (NO OPERATIVA)'
 TEST_EVENT = 'PRUEBA API – ACTIVACIÓN MANUAL (NO OPERATIVA)'
 
-st.set_page_config(page_title='Importador Fracttal · V4', page_icon='🛠️', layout='wide')
+st.set_page_config(page_title='Importador Fracttal · V5', page_icon='🛠️', layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · Versión 4 · Detección del tipo Preventivo y prueba controlada SIN ACTIVOS')
-st.warning('Esta versión permite buscar el ID de Preventivo a partir de tareas existentes y crear, tras confirmación, SOLO una tarea de PRUEBA. No importa el Excel completo.')
+st.caption('Europlátano · Versión 5 · Selección manual de tipos de tarea · SIN ACTIVOS')
+st.warning('Esta versión permite elegir manualmente el tipo de tarea observado en Fracttal, con su nombre exacto e ID. Solo se puede crear UNA tarea de prueba con confirmación; NO importa el Excel completo.')
 
 
 def setting(key):
@@ -161,8 +162,8 @@ if st.button('🧪 Crear plan de prueba en Fracttal', disabled=not can_create_pl
             st.warning(f'El plan de prueba ya existía (ID: {plan_id}); no se ha duplicado.')
 
 st.divider()
-st.header('3 · Localizar tipo Preventivo y probar una tarea')
-st.info('Primero buscamos el identificador de Preventivo leyendo tareas YA EXISTENTES. No alteramos catálogos ni adivinamos IDs. Solo crearemos algo tras confirmación expresa.')
+st.header('3 · Elegir tipo de tarea y probar UNA tarea')
+st.info('Consulta tipos observados en las tareas existentes y elige el nombre e ID exactos. Esto es una lista observada, NO el catálogo completo de tipos configurados en Fracttal.')
 
 
 def fetch_tasks(token, group_id=None):
@@ -212,6 +213,27 @@ def find_id_plan():
         return None, f'Se esperaban exactamente 1 plan de prueba; encontrados: {len(matches)}.'
     return int(matches[0]['id']), None
 
+def observed_type_options(tasks):
+    """Read-only list of distinct (exact label, ID) tuples in existing task records."""
+    observed = {}
+    for row in tasks:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get('tasks_types_main_description') or '').strip()
+        raw = row.get('id_task_type_main')
+        if not name or raw is None:
+            continue
+        try:
+            task_type_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if task_type_id <= 0:
+            continue
+        key = (name, task_type_id)
+        observed[key] = observed.get(key, 0) + 1
+    return observed
+
+
 left, right = st.columns(2)
 with left:
     if st.button('🔎 Localizar plan de prueba', disabled=not ready):
@@ -223,41 +245,48 @@ with left:
             st.session_state.test_plan_id = plan_id_found
             st.success(f'Plan de prueba localizado. ID: {plan_id_found}')
 with right:
-    if st.button('🔎 Buscar ID de Preventivo automáticamente', disabled=not ready):
+    if st.button('🔎 Consultar tipos utilizados en Fracttal', disabled=not ready):
         found_tasks, error = safe_api_action(lambda: fetch_tasks(get_token()))
         if error:
             st.error(error)
-            st.session_state.pop('preventive_type_id', None)
+            st.session_state.pop('observed_types', None)
         else:
-            seen = preventive_type_ids(found_tasks)
-            st.session_state.pop('preventive_type_id', None)
-            st.session_state['preventive_candidates'] = seen
-            st.session_state['tasks_scanned'] = len(found_tasks)
-            if len(seen) == 1:
-                st.session_state.preventive_type_id = next(iter(seen))
-                st.success(f'Preventivo localizado: ID {st.session_state.preventive_type_id}. Identificado en {len(found_tasks)} tareas existentes.')
-            elif not seen:
-                st.warning('No se encontró ningún registro cuya clasificación principal contenga «Preventivo». No se utilizará un ID supuesto.')
+            options = observed_type_options(found_tasks)
+            st.session_state.observed_types = options
+            st.session_state.tasks_scanned = len(found_tasks)
+            if options:
+                st.success(f'Se observaron {len(options)} combinaciones de nombre e ID en {len(found_tasks)} tareas.')
             else:
-                st.error('Se encontraron varios IDs asociados a Preventivo. Se bloquea la creación hasta revisar esta discrepancia.')
+                st.warning('No se encontraron tipos con ID y nombre. No es posible seleccionar un tipo.')
 
 st.write('Plan de prueba:', st.session_state.get('test_plan_id', 'Pendiente'))
-st.write('Tipo principal Preventivo:', st.session_state.get('preventive_type_id', 'Pendiente'))
-if st.session_state.get('preventive_candidates'):
-    st.caption('IDs observados en tareas existentes (ID: número de registros): ' + ', '.join(f'{k}: {v}' for k,v in sorted(st.session_state.preventive_candidates.items())))
+observed = st.session_state.get('observed_types', {})
+selected_key = None
+if observed:
+    st.caption('Solo se muestran tipos presentes en las tareas consultadas. Se conservan diferencias de MAYÚSCULAS, minúsculas y sus ID. La lista no demuestra que el catálogo esté completo.')
+    ordered = sorted(observed, key=lambda pair: (pair[0].casefold(), pair[0], pair[1]))
+    selected_key = st.selectbox('Tipo principal para la tarea de prueba (nombre exacto + ID)',
+                                options=ordered, index=None, placeholder='Elige un tipo de tarea…',
+                                format_func=lambda key: f'{key[0]}  ·  ID {key[1]}  ·  {observed[key]} tarea(s) observadas',
+                                key='test_type_selection')
+    if selected_key:
+        st.success(f'Tipo elegido manualmente: {selected_key[0]} (ID {selected_key[1]}).')
+        if 'preventiv' not in selected_key[0].casefold():
+            st.warning('Has elegido un tipo distinto de Preventivo. La tarea de prueba usará exactamente el tipo seleccionado.')
+else:
+    st.info('Pulsa «Consultar tipos utilizados en Fracttal» para activar el desplegable.')
 
-st.caption('La prueba crea una sola tarea de EVENTO dentro del plan de prueba. Puede incorporar una entrada en el catálogo de eventos. No vincula activos, no importa planes reales y no crea órdenes de trabajo.')
-ack_event = st.checkbox('Autorizo crear UNA tarea de prueba real en el plan de prueba, sin activos.', key='ack_event')
+st.caption('La prueba crea una sola tarea de EVENTO dentro del plan de prueba. Puede añadir un evento al catálogo. No vincula activos, no crea OT ni importa el Excel Reisopack.')
+ack_event = st.checkbox('Autorizo crear UNA tarea de prueba en el plan indicado con el tipo elegido, sin activos.', key='ack_event')
 typed_task = st.text_input('Para autorizar, escribe exactamente CREAR TAREA PRUEBA', key='typed_task')
-can_create_task = bool(ready and st.session_state.get('test_plan_id') and st.session_state.get('preventive_type_id') and ack_event and typed_task == 'CREAR TAREA PRUEBA')
+can_create_task = bool(ready and st.session_state.get('test_plan_id') and selected_key and ack_event and typed_task == 'CREAR TAREA PRUEBA')
 if st.button('🧪 Crear una sola tarea de prueba', disabled=not can_create_task):
     if st.session_state.get('task_post_attempted'):
         st.error('Ya se intentó crear en esta sesión. Verifica Fracttal y evita repetir la operación.')
     else:
-        # Set before any network call to avoid duplicate writes on rerun/timeout.
         st.session_state.task_post_attempted = True
         plan_id = int(st.session_state.test_plan_id)
-        main_type_id = int(st.session_state.preventive_type_id)
+        main_type_id = int(selected_key[1])
         payload = {
             'description': TEST_TASK,
             'id_task_type_main': main_type_id,
@@ -280,25 +309,24 @@ if st.button('🧪 Crear una sola tarea de prueba', disabled=not can_create_task
                 task_data = response.get('data')
                 if isinstance(task_data, dict) and task_data.get('id'):
                     return 'CREADA', task_data['id']
-            # Might have persisted despite unexpected success response. Verify with GET, never resend POST.
             verified = [row for row in fetch_tasks(token, group_id=plan_id)
                         if str(row.get('description', '')).strip().casefold() == TEST_TASK.casefold()]
             if len(verified) == 1:
                 return 'VERIFICADA', verified[0].get('id')
-            raise ValueError('Resultado de creación no confirmado. Revisa la tarea en Fracttal; no reintentes.')
+            raise ValueError('Resultado de creación no confirmado. Revisa Fracttal; no reintentes.')
         result, error = safe_api_action(attempt_task_once)
         if error:
             st.error(error)
-            st.info('No vuelvas a crearla sin revisar el plan en Fracttal. Los permisos ADD sobre Plan de tareas también deben estar habilitados.')
+            st.info('No repitas la creación sin revisar el plan en Fracttal. Comprueba también los permisos ADD sobre Plan de tareas.')
         else:
             state, created_id = result
             if state == 'EXISTE':
                 st.warning('La tarea ya existe en el plan de prueba. No se duplicó.')
             else:
-                st.success(f'Tarea de prueba {state.lower()}. ID: {created_id}. Comprueba en Fracttal sus 2 subtareas y su activador por evento.')
+                st.success(f'Tarea {state.lower()}. ID: {created_id}. Verifica en Fracttal su tipo, activador y sus dos subtareas.')
 
 st.divider()
-st.header('4 · Validar Excel Reisopack (SIN IMPORTAR)')
+st.header('4 · Validar Excel y configurar correspondencias (SIN IMPORTAR)')
 uploaded = st.file_uploader('Selecciona la plantilla Excel (.xlsx)', type=['xlsx'])
 if uploaded is None:
     st.info('Carga el Excel para revisar su estructura. Los activos se asociarán MANUALMENTE después de importar los planes.')
@@ -342,5 +370,55 @@ else:
 for label, table in [('Planes', plans), ('Tareas', tasks), ('Subtareas', subtasks)]:
     with st.expander(f'{label} ({len(table)})', expanded=label == 'Tareas'):
         st.dataframe(table, use_container_width=True, hide_index=True)
+st.subheader('Correspondencias: tipo del Excel → tipo observado en Fracttal')
+st.caption('Selecciona por separado la clasificación de Fracttal para cada valor TIPO_INICIAL del Excel. La elección es explícita; nunca se asigna por similitud. Esta versión solo guarda las correspondencias en un JSON descargable: NO IMPORTA EL EXCEL.')
+if 'TIPO_INICIAL' not in tasks.columns:
+    st.warning('No hay columna TIPO_INICIAL en TAREAS. Para configurar correspondencias, añádela en la plantilla.')
+else:
+    unique_names = sorted({str(value).strip() for value in tasks['TIPO_INICIAL'] if str(value).strip()}, key=str.casefold)
+    if not unique_names:
+        st.warning('No hay tipos de tarea en el Excel.')
+    elif not observed:
+        st.info('Para configurar correspondencias, primero pulsa «Consultar tipos utilizados en Fracttal» en el apartado 3.')
+    else:
+        mapping = {}
+        imported_mapping = {}
+        prior = st.file_uploader('Recuperar correspondencias desde un JSON anterior (opcional)', type=['json'], key='mapping_json')
+        if prior is not None:
+            try:
+                raw = json.loads(prior.getvalue().decode('utf-8'))
+                if not isinstance(raw, dict) or raw.get('schema') != 'fracttal-tipo-correspondencias-v1' or not isinstance(raw.get('mapping'), dict):
+                    raise ValueError('Formato no reconocido')
+                imported_mapping = raw['mapping']
+                st.success('JSON de correspondencias leído. Revisa las selecciones antes de utilizarlo.')
+            except (ValueError, UnicodeError):
+                st.error('JSON inválido. No se aplicaron correspondencias.')
+        choices = sorted(observed, key=lambda pair: (pair[0].casefold(), pair[0], pair[1]))
+        for excel_name in unique_names:
+            saved = imported_mapping.get(excel_name, {})
+            default_pair = None
+            if isinstance(saved, dict):
+                try:
+                    candidate = (str(saved.get('label', '')), int(saved.get('id', 0)))
+                    if candidate in choices:
+                        default_pair = candidate
+                except (TypeError, ValueError):
+                    pass
+            options_with_blank = [None] + choices
+            index = options_with_blank.index(default_pair) if default_pair else 0
+            selected = st.selectbox(f'Excel: «{excel_name}» → Fracttal:', options=options_with_blank,
+                                    index=index, key=f'map_excel_{excel_name}',
+                                    format_func=lambda opt: '— Selecciona un tipo —' if opt is None else f'{opt[0]} · ID {opt[1]} ({observed[opt]} tarea(s))')
+            if selected is not None:
+                mapping[excel_name] = {'label': selected[0], 'id': selected[1]}
+        missing = sorted(set(unique_names) - set(mapping))
+        if missing:
+            st.warning('Correspondencias pendientes: ' + ', '.join(missing))
+        else:
+            st.success('Todas las correspondencias del Excel tienen un tipo seleccionado.')
+        export = {'schema': 'fracttal-tipo-correspondencias-v1', 'mapping': mapping}
+        st.download_button('💾 Descargar correspondencias (.json)', data=json.dumps(export, ensure_ascii=False, indent=2).encode('utf-8'),
+                           file_name='correspondencias_tipos_fracttal.json', mime='application/json', disabled=bool(missing))
+        st.caption('Guarda el JSON en Archivos de tu iPad para reutilizarlo. No contiene claves OAuth ni contraseñas.')
 st.button('Importar el Excel completo (pendiente de implementar)', disabled=True)
 st.caption('No se asocian activos desde este importador. La asociación se hará a mano en Fracttal.')
