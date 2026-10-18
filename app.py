@@ -1,4 +1,4 @@
-"""Europlátano · V14 | staged Fracttal task-plan importer.
+"""Europlátano · V15 | staged Fracttal task-plan importer.
 No asset linking, deleting, OT creation or editing. Two-stage task/subtask writes.
 """
 import io
@@ -12,9 +12,9 @@ import streamlit as st
 API='https://app.fracttal.com/api'
 TOKEN_URL='https://one.fracttal.com/oauth/token'
 TYPES={'Texto':1, 'Verificación':4, 'Lista':7}
-st.set_page_config(page_title='Importador Fracttal V14', page_icon='🛠️',layout='wide')
+st.set_page_config(page_title='Importador Fracttal V15', page_icon='🛠️',layout='wide')
 st.title('🛠️ Importador de planes Fracttal')
-st.caption('Europlátano · V14 · Excel → plan → tareas → subtareas · SIN vincular activos')
+st.caption('Europlátano · V15 · Excel → plan → tareas → subtareas · SIN vincular activos')
 st.warning('IMPORTACIÓN REAL Y CONTROLADA. Elige una tarea y confirma cada escritura. Los activos se vinculan MANUALMENTE en Fracttal.')
 
 def secret(key):
@@ -269,16 +269,19 @@ def mk_sub(row):
     if row.TIPO_SUBTAREA=='Lista':result['dropdown_options']=[{'description':x.strip()} for x in str(row.get('OPCIONES_RESPUESTA','')).split('|') if x.strip()]
     return result
 
-payload={'description':str(r.NOMBRE_TAREA).strip(),'id_task_type_main':selected_types[r.TIPO_INICIAL][1],'id_group_task':plan_id,'triggers':[]}
+# Mimic the V11 successfully tested payload exactly: subtasks is present but empty.
+# The complete checklist is added only in the second POST /tasks_subtasks/.
+payload={'description':str(r.NOMBRE_TAREA).strip(),'id_task_type_main':selected_types[r.TIPO_INICIAL][1],'id_group_task':plan_id,'triggers':[],'subtasks':[]}
 if r.ACTIVADOR=='Fecha':
     val=period_map.get(r.UNIDAD_INTERVALO,0)
     if val:payload['triggers']=[{'id_task_trigger_type':1,'value_main':int(r.INTERVALO),'id_period_date':val,'id_replay':1}]
 else:
     payload['triggers']=[{'id_task_trigger_type':4,'event_description':events[r.ID_TAREA].strip()}]
-try:payload['duration']=max(60,int(r.get('ESTIMACION_MIN','') or '10')*60)
-except (ValueError,TypeError):payload['duration']=600
+# Deliberately do not send duration here: V11 accepted the minimal schema without it.
+# Task duration can be configured later once independently verified.
 subs=[mk_sub(row) for _,row in subrows.iterrows()]
 st.write(f'**{len(subs)} subtareas**, {r.ACTIVADOR}, **sin activos**. Grupo/Parte y adjuntos se enviarán con cada subtarea.')
+st.caption('V15: POST inicial replica la estructura V11 validada (subtasks: [] y sin duration); las subtareas se crean en el segundo paso.')
 with st.expander('Vista previa de tarea (POST /tasks_plan/)',expanded=False):st.json(payload)
 with st.expander('Vista previa de subtareas (POST /tasks_subtasks/)',expanded=False):st.json({'id_task':'<se obtendrá al crear tarea>','is_cyclical':False,'subtasks':subs})
 
@@ -354,4 +357,4 @@ if existing is not None and len(existing)==1:
                     st.error(fmt_error(exc));st.warning('Comprueba Fracttal antes de repetir; puede haber una escritura parcial.')
 
 st.divider()
-st.caption('V14 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
+st.caption('V15 no asocia activos, no modifica ni elimina planes/tareas, no crea OT y no guarda secretos en el Excel. Importación deliberadamente por tarea con verificación, no masiva de una sola pulsación.')
